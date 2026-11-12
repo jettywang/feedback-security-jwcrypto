@@ -811,6 +811,176 @@ class TestJWK(unittest.TestCase):
         s.serialize()
 
 
+class TestJWKSetBuilder(unittest.TestCase):
+
+    @staticmethod
+    def _reordered(key):
+        # Same material, JSON members in a different order
+        params = json_decode(key.export())
+        return jwk.JWK(**dict(reversed(list(params.items()))))
+
+    def test_dedup_rsa_forms(self):
+        key = jwk.JWK.generate(kty='RSA', size=2048)
+        pub = jwk.JWK.from_json(key.export_public())
+        builder = jwk.JWKSetBuilder()
+        builder.add(pub, kid='display-1')
+        builder.add(self._reordered(pub), kid='display-2')
+        builder.add(key)  # private form of the same material
+        self.assertEqual(len(builder), 1)
+        self.assertIn(pub, builder)
+        self.assertIn(key, builder)
+        keyset = builder.build()
+        self.assertEqual(len(keyset['keys']), 1)
+        stored = keyset.get_key('display-1')
+        self.assertIsNotNone(stored)
+        # display kid is not identity: the first one wins
+        self.assertIsNone(keyset.get_key('display-2'))
+        # the private form was retained once seen
+        self.assertTrue(stored.has_private)
+        self.assertEqual(stored.thumbprint(), key.thumbprint())
+
+    def test_dedup_ec_forms(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        pub = jwk.JWK.from_json(key.export_public())
+        builder = jwk.JWKSetBuilder()
+        builder.add(self._reordered(pub))
+        builder.add(pub)
+        builder.add(key)
+        self.assertEqual(len(builder), 1)
+        stored = builder.get_key(pub)
+        self.assertTrue(stored.has_private)
+        self.assertEqual(stored.thumbprint(), key.thumbprint())
+
+    def test_conflicting_use_rejected(self):
+        key = jwk.JWK.generate(kty='RSA', size=2048)
+        pub = key.export_public(as_dict=True)
+        builder = jwk.JWKSetBuilder()
+        builder.add(pub, use='sig')
+        with self.assertRaises(jwk.JWKUsageConflict):
+            builder.add(pub, use='enc')
+        # the original constraint is retained, not unioned
+        self.assertEqual(builder.get_key(jwk.JWK(**pub)).get('use'), 'sig')
+
+    def test_conflicting_key_ops_rejected(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        pub = key.export_public(as_dict=True)
+        builder = jwk.JWKSetBuilder()
+        builder.add(pub, key_ops=['verify'])
+        # identical constraints merge, order does not matter
+        builder.add(pub, key_ops=['verify'])
+        with self.assertRaises(jwk.JWKUsageConflict):
+            builder.add(pub, key_ops=['sign'])
+        with self.assertRaises(jwk.JWKUsageConflict):
+            builder.add(pub, key_ops=['sign', 'verify'])
+        self.assertEqual(builder.get_key(jwk.JWK(**pub)).get('key_ops'),
+                         ['verify'])
+
+    def test_unconstrained_duplicate_keeps_constraint(self):
+        key = jwk.JWK.generate(kty='RSA', size=2048)
+        pub = key.export_public(as_dict=True)
+        builder = jwk.JWKSetBuilder()
+        builder.add(pub, use='sig')
+        builder.add(pub)  # no metadata: must not widen or clear
+        self.assertEqual(builder.get_key(jwk.JWK(**pub)).get('use'), 'sig')
+
+    def test_public_export_hides_private_and_symmetric(self):
+        rsakey = jwk.JWK.generate(kty='RSA', size=2048)
+        symkey = jwk.JWK.generate(kty='oct', size=256)
+        builder = jwk.JWKSetBuilder()
+        builder.add(rsakey, kid='rsa-1', use='sig')
+        builder.add(symkey, kid='sym-1')
+        listing = builder.export_public(as_dict=True)
+        self.assertEqual(len(listing['keys']), 2)
+        by_kid = {k['kid']: k for k in listing['keys']}
+        rsa_entry = by_kid['rsa-1']
+        # public members and identity are present ...
+        self.assertEqual(rsa_entry['kty'], 'RSA')
+        self.assertIn('n', rsa_entry)
+        self.assertIn('e', rsa_entry)
+        self.assertEqual(rsa_entry['thumbprint'], rsakey.thumbprint())
+        self.assertEqual(rsa_entry['use'], 'sig')
+        # ... but no private material
+        for private_member in ('d', 'p', 'q', 'dp', 'dq', 'qi', 'oth'):
+            self.assertNotIn(private_member, rsa_entry)
+        sym_entry = by_kid['sym-1']
+        # the symmetric secret is never listed, identity still checkable
+        self.assertEqual(sym_entry['kty'], 'oct')
+        self.assertNotIn('k', sym_entry)
+        self.assertEqual(sym_entry['thumbprint'], symkey.thumbprint())
+        self.assertNotIn(symkey.get('k'), builder.export_public())
+
+    def test_jws_constraints_survive_dedup(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        pub = key.export_public(as_dict=True)
+        builder = jwk.JWKSetBuilder()
+        builder.add(key, kid='ec-1', key_ops=['verify'])
+        # a duplicate trying to widen authorization is rejected
+        with self.assertRaises(jwk.JWKUsageConflict):
+            builder.add(pub, key_ops=['sign'])
+        keyset = builder.build()
+        stored = keyset.get_key('ec-1')
+        payload = b'important message'
+        # signing is still forbidden for this material
+        s = jws.JWS(payload)
+        with self.assertRaises(jwk.InvalidJWKOperation):
+            s.add_signature(stored, None, protected={'alg': 'ES256'})
+        # while verification with the same material works
+        signer = jwk.JWK.from_json(key.export())
+        s = jws.JWS(payload)
+        s.add_signature(signer, None, protected={'alg': 'ES256'})
+        token = s.serialize(compact=True)
+        v = jws.JWS()
+        v.deserialize(token)
+        v.verify(stored)
+        self.assertEqual(v.payload, payload)
+
+    def test_jws_use_constraint_survives_dedup(self):
+        key = jwk.JWK.generate(kty='RSA', size=2048)
+        pub = key.export_public(as_dict=True)
+        builder = jwk.JWKSetBuilder()
+        builder.add(key, kid='rsa-1', use='enc')
+        builder.add(pub)  # plain duplicate must not clear the constraint
+        stored = builder.build().get_key('rsa-1')
+        s = jws.JWS(b'data')
+        with self.assertRaises(jwk.InvalidJWKUsage):
+            s.add_signature(stored, None, protected={'alg': 'RS256'})
+        # a properly authorized key still signs and verifies after dedup
+        builder = jwk.JWKSetBuilder()
+        builder.add(key, kid='rsa-2', use='sig')
+        builder.add(self._reordered(jwk.JWK.from_json(key.export_public())),
+                    use='sig')
+        self.assertEqual(len(builder), 1)
+        stored = builder.build().get_key('rsa-2')
+        s = jws.JWS(b'data')
+        s.add_signature(stored, None, protected={'alg': 'RS256'})
+        token = s.serialize(compact=True)
+        v = jws.JWS()
+        v.deserialize(token)
+        v.verify(stored)
+        self.assertEqual(v.payload, b'data')
+
+    def test_symmetric_jws_after_dedup(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        builder = jwk.JWKSetBuilder()
+        builder.add(key, kid='sym-1', key_ops=['sign'])
+        builder.add(json_decode(key.export()))  # same material, no metadata
+        self.assertEqual(len(builder), 1)
+        stored = builder.build().get_key('sym-1')
+        s = jws.JWS(b'data')
+        s.add_signature(stored, None, protected={'alg': 'HS256'})
+        token = s.serialize(compact=True)
+        # verify is forbidden by the retained key_ops constraint
+        with self.assertRaises(jwk.InvalidJWKOperation):
+            stored.get_op_key('verify')
+        v = jws.JWS()
+        v.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify(stored)
+        # an unconstrained copy of the same secret verifies fine
+        v.verify(jwk.JWK.from_json(key.export()))
+        self.assertEqual(v.payload, b'data')
+
+
 # RFC 7515 - A.1
 A1_protected = \
     [123, 34, 116, 121, 112, 34, 58, 34, 74, 87, 84, 34, 44, 13, 10, 32,

@@ -360,6 +360,27 @@ class InvalidJWKValue(JWException):
     """
 
 
+class JWKUsageConflict(JWException):
+    """Conflicting authorization metadata on duplicate key material.
+
+    This exception is raised by :class:`JWKSetBuilder` when the same
+    key material is added more than once with incompatible 'use' or
+    'key_ops' authorization constraints.  Conflicts are never resolved
+    by silently unioning the constraints.
+    """
+
+    def __init__(self, thumbprint, field, existing, new):
+        super(JWKUsageConflict, self).__init__()
+        self.thumbprint = thumbprint
+        self.field = field
+        self.existing = existing
+        self.new = new
+
+    def __str__(self):
+        return ('Conflicting "%s" for key material %s: %r vs %r' %
+                (self.field, self.thumbprint, self.existing, self.new))
+
+
 class JWK(dict):
     """JSON Web Key object
 
@@ -1561,3 +1582,174 @@ class JWKSet(dict):
                 v = keys
             repr_dict[k] = v
         return json_encode(repr_dict)
+
+
+class JWKSetBuilder:
+    """Builds a :class:`JWKSet` deduplicated by key material.
+
+    Unlike :class:`JWKSet`, which treats (thumbprint, kid) pairs as
+    distinct elements, this builder identifies keys purely by their
+    cryptographic material: the RFC 7638 thumbprint computed over the
+    public members.  The same key imported in public or private form,
+    or serialized with its JSON members in a different order, maps to
+    a single record.
+
+    Three concerns are kept explicitly separate:
+
+     * Material identity: the RFC 7638 thumbprint, used for dedup.
+     * Display 'kid': a non-identifying label; the first one seen for
+       a given material is kept.
+     * Local authorization metadata: the 'use' and 'key_ops'
+       constraints.  Duplicates carrying identical constraints merge;
+       a duplicate that tries to change an already-set constraint
+       raises :class:`JWKUsageConflict`.  Constraints are never
+       silently unioned, so merging can not widen what a key is
+       allowed to do.
+    """
+
+    def __init__(self):
+        self._records = {}
+
+    @staticmethod
+    def _normalize_ops(key_ops):
+        if key_ops is None:
+            return None
+        if not isinstance(key_ops, list):
+            key_ops = [key_ops]
+        return sorted(set(key_ops))
+
+    def _merge_meta(self, thumbprint, field, existing, new):
+        if existing is None:
+            return new
+        if new is None or new == existing:
+            return existing
+        raise JWKUsageConflict(thumbprint, field, existing, new)
+
+    def add(self, key, kid=None, use=None, key_ops=None):
+        """Adds a key to the set being built.
+
+        :param key: A :class:`JWK` object, or a dict of JWK parameters.
+            Any 'kid', 'use' or 'key_ops' already present on the key
+            are used unless explicitly overridden.
+        :param kid: An optional display key identifier.  It is not
+            part of the material identity.
+        :param use: An optional 'use' authorization constraint.
+        :param key_ops: An optional 'key_ops' authorization constraint.
+
+        :raises JWKUsageConflict: if the same material was already
+            added with a different 'use' or 'key_ops' constraint.
+        :raises TypeError: if the key cannot be interpreted as a JWK.
+        """
+        if not isinstance(key, JWK):
+            key = JWK(**key)
+        # Work on a copy so the caller's key is never mutated.
+        stored = JWK.from_json(key.export())
+        if kid is None:
+            kid = key.get('kid')
+        if use is None:
+            use = key.get('use')
+        if key_ops is None:
+            key_ops = key.get('key_ops')
+        key_ops = self._normalize_ops(key_ops)
+
+        thumbprint = stored.thumbprint()
+        existing = self._records.get(thumbprint)
+        if existing is None:
+            if kid is not None:
+                stored['kid'] = kid
+            if use is not None:
+                stored['use'] = use
+            if key_ops is not None:
+                stored['key_ops'] = key_ops
+            self._records[thumbprint] = stored
+            return
+
+        merged_use = self._merge_meta(thumbprint, 'use',
+                                      existing.get('use'), use)
+        merged_ops = self._merge_meta(thumbprint, 'key_ops',
+                                      existing.get('key_ops'), key_ops)
+        # Prefer private material when available; the identity is the
+        # same, so holding the richer form cannot confuse dedup.
+        old_kid = existing.get('kid')
+        if stored.has_private and not existing.has_private:
+            existing = stored
+            self._records[thumbprint] = existing
+        if old_kid is not None:
+            # The display kid is not part of the identity; first wins.
+            kid = old_kid
+        if existing.get('kid') is None and kid is not None:
+            existing['kid'] = kid
+        if merged_use is not None:
+            existing['use'] = merged_use
+        if merged_ops is not None:
+            existing['key_ops'] = merged_ops
+
+    def __len__(self):
+        return len(self._records)
+
+    def __contains__(self, key):
+        if not isinstance(key, JWK):
+            return False
+        return key.thumbprint() in self._records
+
+    def get_key(self, key):
+        """Returns the stored record matching the key's material.
+
+        :param key: A :class:`JWK` object used to derive the material
+            identity.
+
+        :return: The stored JWK, or None if the material is unknown.
+        :rtype: JWK
+        """
+        return self._records.get(key.thumbprint())
+
+    def build(self):
+        """Builds a :class:`JWKSet` from the deduplicated records.
+
+        The returned set retains the full (including private, when
+        provided) key material and the merged 'use'/'key_ops'
+        constraints, so JWS/JWE operations enforce them.
+
+        :return: A JWKSet with one key per distinct material.
+        :rtype: JWKSet
+        """
+        keyset = JWKSet()
+        for record in self._records.values():
+            keyset.add(record)
+        return keyset
+
+    def export_public(self, as_dict=False):
+        """Exports a public listing of the deduplicated records.
+
+        Asymmetric keys are reduced to their public members; symmetric
+        keys are listed only by type, 'kid' and thumbprint so the
+        shared secret is never disclosed.  Every entry carries a
+        'thumbprint' member so a peer can verify the material identity
+        of the corresponding key.
+
+        :param as_dict(bool): Whether to return a dict instead of
+            a JSON object
+
+        :return: A portable public representation of the key set.
+            If as_dict is True then a dictionary is returned.
+            By default a json string
+        :rtype: `str` or `dict`
+        """
+        keys = []
+        for thumbprint, record in self._records.items():
+            if record.is_symmetric:
+                entry = {'kty': record.get('kty')}
+            else:
+                entry = record.export_public(as_dict=True)
+            if record.get('kid') is not None:
+                entry['kid'] = record.get('kid')
+            if record.get('use') is not None:
+                entry['use'] = record.get('use')
+            if record.get('key_ops') is not None:
+                entry['key_ops'] = record.get('key_ops')
+            entry['thumbprint'] = thumbprint
+            keys.append(entry)
+        listing = {'keys': keys}
+        if as_dict is True:
+            return listing
+        return json_encode(listing)

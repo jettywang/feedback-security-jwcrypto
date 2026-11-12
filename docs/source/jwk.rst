@@ -18,6 +18,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jwk.JWKSetBuilder
+   :members:
+   :show-inheritance:
+
 Exceptions
 ----------
 
@@ -34,6 +38,10 @@ Exceptions
    :show-inheritance:
 
 .. autoclass:: jwcrypto.jwk.InvalidJWKUsage
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwk.JWKUsageConflict
    :members:
    :show-inheritance:
 
