@@ -1,5 +1,6 @@
 # Copyright (C) 2015 JWCrypto Project Contributors - see LICENSE file
 
+import copy
 import zlib
 
 from jwcrypto import common
@@ -52,6 +53,40 @@ default_allowed_algs = [
     'A128CBC-HS256', 'A192CBC-HS384', 'A256CBC-HS512',
     'A128GCM', 'A192GCM', 'A256GCM']
 """Default allowed algorithms"""
+
+# Key management algorithms that generate a CEK which can be reused when
+# re-wrapping the same content under a new recipient key.  Algorithms that
+# derive the CEK from the recipient key ('dir' and bare 'ECDH-ES') cannot
+# be used because the content ciphertext is bound to the original CEK.
+# RSA1_5 is deliberately excluded as it is prohibited by RFC 7516 and is not
+# part of the default allowed algorithms.
+rekey_keymgmt_algs = [
+    'RSA-OAEP', 'RSA-OAEP-256',
+    'A128KW', 'A192KW', 'A256KW',
+    'A128GCMKW', 'A192GCMKW', 'A256GCMKW',
+    'ECDH-ES+A128KW', 'ECDH-ES+A192KW', 'ECDH-ES+A256KW',
+    'PBES2-HS256+A128KW', 'PBES2-HS384+A192KW', 'PBES2-HS512+A256KW',
+]
+"""Key management algorithms usable for recipient re-keying.
+
+These algorithms wrap an existing CEK and therefore allow the protected
+header, AAD, IV, ciphertext and tag of an already authenticated token to be
+preserved byte-for-byte.  'dir' and bare 'ECDH-ES' are intentionally absent:
+they derive the CEK from the recipient key and cannot reuse an existing one.
+"""
+
+
+def _rekey_alg_error(name):
+    if name == 'dir':
+        return ('"dir" derives the content encryption key from the recipient '
+                'key and cannot reuse an existing CEK')
+    if name == 'ECDH-ES':
+        return ('"ECDH-ES" derives the content encryption key from the '
+                'recipient key and cannot reuse an existing CEK')
+    if name == 'RSA1_5':
+        return ('"RSA1_5" is a prohibited key management algorithm and is '
+                'not supported for re-keying')
+    return '"%s" cannot reuse an existing CEK for re-keying' % name
 
 
 # These have been moved to jwcrypto.common, maintain here for backwards compat
@@ -260,6 +295,264 @@ class JWE:
         else:
             self.objects['recipients'] = [rec]
 
+    def rekey(self, key, new_key, header=None):
+        """Re-wrap a recipient's CEK under a new key.
+
+        The token is first authenticated with ``key``.  Only after the
+        protected header, AAD, IV, ciphertext and tag have been verified is
+        the existing CEK wrapped for ``new_key``.  The content encryption is
+        never repeated, so those authenticated bytes are kept exactly as
+        they were.  Existing recipients are replaced by the new one; the
+        original object is never modified.
+
+        :param key: The current recipient key (:class:`jwcrypto.jwk.JWK`)
+         or password able to decrypt the token.
+        :param new_key: The new recipient key, appropriate for the token's
+         key management algorithm.
+        :param header: An optional JSON string or dict with additional
+         *per-recipient* header parameters.  Parameters already present in
+         the protected or shared unprotected header cannot be changed.
+
+        :raises InvalidJWEOperation: if the token has no ciphertext, the
+         key management algorithm cannot reuse a CEK, the protected header
+         would have to change, or recipients use incompatible algorithms.
+        :raises InvalidJWEData: if the old token cannot be authenticated or
+         a recipient header is invalid.
+
+        :return: A new :class:`JWE` object encrypted for ``new_key``
+        :rtype: JWE
+        """
+        if 'ciphertext' not in self.objects:
+            raise InvalidJWEOperation('No available ciphertext')
+
+        if header is not None:
+            if isinstance(header, dict):
+                header = json_encode(header)
+            try:
+                caller_header = json_decode(header)
+            except ValueError as e:
+                raise InvalidJWEOperation(
+                    'Invalid recipient header', e) from e
+            if not isinstance(caller_header, dict):
+                raise InvalidJWEOperation(
+                    'Recipient header must be a JSON object')
+        else:
+            caller_header = {}
+
+        if 'recipients' in self.objects:
+            recipients = self.objects['recipients']
+            if len(recipients) > default_max_recipients:
+                raise InvalidJWEData(
+                    'Too many recipients (%d)' % len(recipients))
+            if not recipients:
+                raise InvalidJWEData('No recipients')
+            ppe_list = recipients
+            has_recipients = True
+        else:
+            ppe_list = [self.objects]
+            has_recipients = False
+
+        # Work out the algorithms from the headers only.  In particular,
+        # reject modes that derive the CEK from the recipient key before
+        # asking for or generating anything.
+        alg_names = []
+        enc_names = set()
+        for ppe in ppe_list:
+            try:
+                jh = self._get_jose_header(ppe.get('header'))
+            except ValueError as e:
+                raise InvalidJWEData('Invalid header encoding', e) from e
+            alg_name = jh.get('alg')
+            if alg_name is None:
+                raise InvalidJWEData('Missing "alg" from headers')
+            enc_name = jh.get('enc')
+            if enc_name is None:
+                raise InvalidJWEData('Missing "enc" from headers')
+            self._jwa_keymgmt(alg_name)
+            self._jwa_enc(enc_name)
+            if alg_name not in rekey_keymgmt_algs:
+                raise InvalidJWEOperation(_rekey_alg_error(alg_name))
+            alg_names.append(alg_name)
+            enc_names.add(enc_name)
+
+        if len(enc_names) != 1:
+            raise InvalidJWEOperation(
+                'Recipients use different content encryption algorithms')
+        enc_name = enc_names.pop()
+        if len(set(alg_names)) != 1:
+            raise InvalidJWEOperation(
+                'Recipients use different key management algorithms')
+        alg_name = alg_names[0]
+
+        protected = json_decode(self.objects.get('protected', '{}'))
+        unprotected = json_decode(self.objects.get('unprotected', '{}'))
+
+        # The key management algorithm may only change when it is not in
+        # the protected or shared header; changing either would alter
+        # authenticated bytes or shared semantics.
+        requested_alg = caller_header.get('alg', alg_name)
+        if requested_alg not in rekey_keymgmt_algs:
+            raise InvalidJWEOperation(_rekey_alg_error(str(requested_alg)))
+        if requested_alg != alg_name:
+            if 'alg' in protected:
+                raise InvalidJWEOperation(
+                    'Cannot change protected header parameter "alg"')
+            if 'alg' in unprotected:
+                raise InvalidJWEOperation(
+                    'Cannot change shared header parameter "alg"')
+            alg_name = requested_alg
+        if caller_header.get('enc', enc_name) != enc_name:
+            raise InvalidJWEOperation(
+                'Cannot change protected header parameter "enc"')
+
+        # Authenticate the old token and recover its CEK without expanding
+        # the payload.  This only reports success after the content tag has
+        # been verified, and never writes any state to this object.
+        cek = self._authenticated_cek(key, ppe_list)
+
+        old_recipient_header = {}
+        if len(ppe_list) == 1:
+            old_recipient_header = json_decode(
+                ppe_list[0].get('header', '{}'))
+
+        # Keep harmless custom per-recipient headers, but drop key-specific
+        # values that belong to the old wrapping (or the old key).
+        generated = {'alg', 'enc', 'kid', 'epk', 'iv', 'tag', 'p2s', 'p2c'}
+        rec_header = {}
+        for name, value in old_recipient_header.items():
+            if name not in generated:
+                rec_header[name] = value
+
+        # alg/enc must be available to the new wrapping headers somewhere.
+        for name, value in (('alg', alg_name), ('enc', enc_name)):
+            if name not in protected and name not in unprotected:
+                rec_header[name] = value
+
+        # A caller supplied header is per-recipient only.  Refuse requests
+        # that would modify authenticated or shared headers.
+        for name, value in caller_header.items():
+            if name == 'aad':
+                raise InvalidJWEOperation(
+                    'AAD is a top-level authenticated member, not a header')
+            if name in ('alg', 'enc'):
+                continue
+            if name in ('epk', 'iv', 'tag', 'p2s', 'p2c'):
+                raise InvalidJWEOperation(
+                    'Header parameter "%s" is generated by the key '
+                    'management algorithm' % name)
+            if name in protected:
+                if protected[name] != value:
+                    raise InvalidJWEOperation(
+                        'Cannot change protected header parameter "%s"' %
+                        name)
+                continue
+            if name in unprotected:
+                if unprotected[name] != value:
+                    raise InvalidJWEOperation(
+                        'Cannot override shared unprotected header '
+                        'parameter "%s"' % name)
+                continue
+            rec_header[name] = value
+
+        # Prefer the new key's identity when it exposes one, unless kid is
+        # already fixed by the protected/shared header or the caller.
+        try:
+            new_kid = new_key.get('kid')
+        except AttributeError:
+            new_kid = None
+        if new_kid:
+            fixed_kid = caller_header.get(
+                'kid', protected.get('kid', unprotected.get('kid')))
+            if fixed_kid and fixed_kid != new_kid:
+                raise InvalidJWEOperation(
+                    'New key "kid" does not match the token header')
+            if not fixed_kid and 'kid' not in protected and \
+                    'kid' not in unprotected:
+                rec_header['kid'] = new_kid
+
+        # Build the result as an independent object.  The CEK and plaintext
+        # are never attached to it and stay unavailable until a new decrypt.
+        result = JWE(flattened=self.flattened,
+                     algs=self._allowed_algs,
+                     header_registry=None)
+        result.header_registry = copy.deepcopy(self.header_registry)
+        result.objects = copy.deepcopy(self.objects)
+        result.plaintext = None
+        result.cek = None
+        result.decryptlog = None
+        for name in ('recipients', 'encrypted_key', 'header'):
+            result.objects.pop(name, None)
+
+        # pylint: disable=protected-access
+        jh = result._get_jose_header(
+            json_encode(rec_header) if rec_header else None)
+        alg, enc = result._get_alg_enc_from_headers(jh)
+        # pylint: enable=protected-access
+
+        wrapped = None
+        try:
+            wrapped = alg.wrap(new_key, enc.wrap_key_size, cek, jh)
+            if wrapped.get('cek') != cek:
+                raise InvalidJWEOperation(
+                    'Key management algorithm did not reuse the CEK')
+
+            ek = wrapped.get('ek', b'')
+            wrapped_header = wrapped.get('header', {})
+            if not isinstance(wrapped_header, dict):
+                wrapped_header = json_decode(wrapped_header)
+            collision = set(wrapped_header) & (
+                set(protected) | set(unprotected))
+            if collision:
+                raise InvalidJWEOperation(
+                    'Re-keying would change protected or shared header '
+                    'parameter(s): %s' % ', '.join(sorted(collision)))
+            try:
+                rec_header = merge_headers(rec_header, wrapped_header,
+                                           registry=self.header_registry)
+            except InvalidJWSEHeader as e:
+                raise InvalidJWEData(str(e)) from e
+
+            # The wrapping headers must also agree with any alg/enc that
+            # are already in the protected or shared unprotected header.
+            for name, value in wrapped_header.items():
+                if name in protected and protected[name] != value:
+                    raise InvalidJWEOperation(
+                        'Re-keying would change protected header '
+                        'parameter "%s"' % name)
+                if name in unprotected and unprotected[name] != value:
+                    raise InvalidJWEOperation(
+                        'Re-keying would change shared header '
+                        'parameter "%s"' % name)
+
+            rec = {}
+            if ek:
+                rec['encrypted_key'] = ek
+            if rec_header:
+                rec['header'] = json_encode(rec_header)
+
+            if has_recipients:
+                result.objects['recipients'] = [rec]
+            else:
+                result.objects.update(rec)
+            result.cek = None
+            result.plaintext = None
+            return result
+        finally:
+            wrapped = None
+            cek = None
+
+    def rewrap(self, key, new_key, header=None):
+        """Alias for :meth:`rekey`."""
+        return self.rekey(key, new_key, header=header)
+
+    def rekey_recipient(self, key, new_key, header=None):
+        """Alias for :meth:`rekey`."""
+        return self.rekey(key, new_key, header=header)
+
+    def rewrap_recipient(self, key, new_key, header=None):
+        """Alias for :meth:`rekey`."""
+        return self.rekey(key, new_key, header=header)
+
     def serialize(self, compact=False):
         """Serializes the object into a JWE token.
 
@@ -355,6 +648,56 @@ class JWE:
         self.decryptlog.append('Success')
         self.cek = cek
         return data
+
+    def _authenticated_cek(self, key, ppe_list):
+        """Return the CEK only after the content tag is verified.
+
+        Unlike :meth:`decrypt` this neither stores the CEK on the object nor
+        decompresses the payload.  A CEK is returned only for a recipient
+        whose tag verification succeeded.
+        """
+        aad = base64url_encode(self.objects.get('protected', ''))
+        if 'aad' in self.objects:
+            aad += '.' + base64url_encode(self.objects['aad'])
+        aad = aad.encode('utf-8')
+
+        for ppe in ppe_list:
+            jh = self._get_jose_header(ppe.get('header'))
+            try:
+                validate_headers(jh, registry=self.header_registry,
+                                 target=self)
+            except InvalidJWSEHeader as e:
+                raise InvalidJWEData(str(e)) from e
+
+            alg = self._jwa_keymgmt(jh.get('alg', None))
+            enc = self._jwa_enc(jh.get('enc', None))
+            enckey = ppe.get('encrypted_key', b'')
+
+            if isinstance(key, JWKSet):
+                keys = key
+                if 'kid' in jh:
+                    kid_keys = key.get_keys(jh['kid'])
+                    if not kid_keys:
+                        continue
+                    keys = kid_keys
+            else:
+                keys = [key]
+
+            for k in keys:
+                try:
+                    cek = alg.unwrap(k, enc.wrap_key_size, enckey, jh)
+                    # Raises unless the authenticated tag is valid.  The
+                    # plaintext is intentionally discarded.
+                    enc.decrypt(cek, aad, self.objects['iv'],
+                                self.objects['ciphertext'],
+                                self.objects['tag'])
+                    return cek
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+        if isinstance(key, JWKSet):
+            raise JWKeyNotFound('Key Not found in JWKSet')
+        raise InvalidJWEData('No recipient matched the provided key')
 
     # FIXME: allow to specify which algorithms to accept as valid
     def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size):

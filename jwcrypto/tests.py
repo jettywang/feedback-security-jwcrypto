@@ -1819,6 +1819,169 @@ class TestJWE(unittest.TestCase):
         b.decrypt(key_pbes)
         self.assertEqual(b.payload, payload)
 
+    def test_rekey_preserves_authenticated_bytes(self):
+        old = jwk.JWK.generate(kty='oct', size=256, kid='old')
+        new = jwk.JWK.generate(kty='oct', size=256, kid='new')
+        payload = b'archive payload'
+        e = jwe.JWE(plaintext=payload,
+                    protected={'enc': 'A256GCM'},
+                    aad=b'archive-context',
+                    flattened=False)
+        e.add_recipient(old, header={'alg': 'A256KW', 'kid': 'old'})
+        token = e.serialize(compact=False)
+        original_objects = copy.deepcopy(e.objects)
+
+        new_token = e.rekey(old, new).serialize(compact=False)
+
+        # The original object is untouched by a successful re-key.
+        self.assertEqual(e.objects, original_objects)
+        self.assertEqual(e.plaintext, payload)
+
+        old_json = json_decode(token)
+        new_json = json_decode(new_token)
+        for field in ('protected', 'aad', 'iv', 'ciphertext', 'tag'):
+            self.assertEqual(old_json[field], new_json[field])
+            self.assertEqual(base64url_decode(old_json[field]),
+                             base64url_decode(new_json[field]))
+
+        # The new key decrypts to the same content; the old one does not
+        # appear any more.
+        check = jwe.JWE()
+        check.deserialize(new_token, new)
+        self.assertEqual(check.payload, payload)
+        self.assertEqual(len(json_decode(new_token)['recipients']), 1)
+        self.assertEqual(check.jose_header[0]['kid'], 'new')
+
+        with self.assertRaises(jwe.InvalidJWEData):
+            other = jwe.JWE()
+            other.deserialize(new_token)
+            other.decrypt(old)
+
+        result = e.rekey(old, new)
+        self.assertIsNone(result.plaintext)
+        self.assertIsNone(result.cek)
+
+    def test_rekey_rejects_tampered_tag(self):
+        key = jwk.JWK.generate(kty='oct', size=256, kid='old')
+        new = jwk.JWK.generate(kty='oct', size=256, kid='new')
+        e = jwe.JWE(plaintext=b'tamper-check',
+                    protected={'alg': 'A256KW', 'enc': 'A256GCM'},
+                    recipient=key)
+        token = e.serialize()
+        tampered = bytearray(base64url_decode(json_decode(token)['tag']))
+        tampered[0] ^= 0x01
+        bad = json_encode(
+            dict(json_decode(token), tag=base64url_encode(bytes(tampered))))
+
+        obj = jwe.JWE()
+        obj.deserialize(bad)
+        with self.assertRaises(jwe.InvalidJWEData):
+            obj.rekey(key, new)
+
+        # No new wrapping can be produced and the object is unchanged.
+        self.assertNotIn('recipients', obj.objects)
+        self.assertEqual(obj.objects['tag'], bytes(tampered))
+        self.assertIsNone(obj.plaintext)
+        self.assertIsNone(obj.cek)
+
+    def test_rekey_rejects_unsupported_keymgmt(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        new = jwk.JWK.generate(kty='oct', size=256)
+
+        direct = jwe.JWE(plaintext=b'dir',
+                         protected={'alg': 'dir', 'enc': 'A256GCM'})
+        direct.add_recipient(key)
+        with self.assertRaisesRegex(jwe.InvalidJWEOperation,
+                                    '"dir" derives the content'):
+            direct.rekey(key, new)
+
+        ec = jwk.JWK.generate(kty='EC', crv='P-256')
+        ecdh = jwe.JWE(plaintext=b'ecdh',
+                       protected={'alg': 'ECDH-ES', 'enc': 'A256GCM'})
+        ecdh.add_recipient(ec)
+        with self.assertRaisesRegex(jwe.InvalidJWEOperation,
+                                    '"ECDH-ES" derives the content'):
+            ecdh.rekey(ec, jwk.JWK.generate(kty='EC', crv='P-256'))
+
+    def test_rekey_rejects_protected_header_change(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        new = jwk.JWK.generate(kty='oct', size=256)
+        e = jwe.JWE(plaintext=b'protected',
+                    protected={'alg': 'A256KW', 'enc': 'A256GCM'},
+                    recipient=key)
+        with self.assertRaisesRegex(jwe.InvalidJWEOperation,
+                                    'Cannot change protected header'):
+            e.rekey(key, new, header={'enc': 'A128GCM'})
+        with self.assertRaisesRegex(jwe.InvalidJWEOperation,
+                                    'Cannot change protected header'):
+            e.rekey(key, new, header={'alg': 'A128KW'})
+        with self.assertRaisesRegex(jwe.InvalidJWEOperation,
+                                    'AAD is a top-level authenticated member'):
+            e.rekey(key, new, header={'aad': 'x'})
+
+    def test_rekey_can_change_unprotected_alg(self):
+        key = jwk.JWK.generate(kty='oct', size=256, kid='old')
+        new = jwk.JWK.generate(kty='oct', size=256, kid='new')
+        e = jwe.JWE(plaintext=b'alg-change', protected={'enc': 'A256GCM'})
+        e.add_recipient(key, header={'alg': 'A256KW', 'kid': 'old'})
+        old_token = e.serialize()
+
+        new_token = e.rekey(key, new,
+                            header={'alg': 'A256GCMKW'}).serialize()
+        old_json = json_decode(old_token)
+        new_json = json_decode(new_token)
+        for field in ('protected', 'iv', 'ciphertext', 'tag'):
+            self.assertEqual(old_json[field], new_json[field])
+
+        check = jwe.JWE()
+        check.deserialize(new_token, new)
+        self.assertEqual(check.payload, b'alg-change')
+        self.assertEqual(check.jose_header['alg'], 'A256GCMKW')
+        self.assertEqual(check.jose_header['kid'], 'new')
+
+    def test_rekey_multiple_recipients_removes_old(self):
+        key1 = jwk.JWK.generate(kty='oct', size=256, kid='key1')
+        key2 = jwk.JWK.generate(kty='oct', size=256, kid='key2')
+        key3 = jwk.JWK.generate(kty='oct', size=256, kid='key3')
+        e = jwe.JWE(plaintext=b'multi-recipient',
+                    protected={'enc': 'A256GCM'},
+                    flattened=False)
+        e.add_recipient(key1, header={'alg': 'A256KW', 'kid': 'key1'})
+        e.add_recipient(key2, header={'alg': 'A256KW', 'kid': 'key2'})
+
+        new_token = e.rekey(key1, key3).serialize()
+        self.assertEqual(len(json_decode(new_token)['recipients']), 1)
+
+        check = jwe.JWE()
+        check.deserialize(new_token, key3)
+        self.assertEqual(check.payload, b'multi-recipient')
+
+        for removed in (key1, key2):
+            other = jwe.JWE()
+            other.deserialize(new_token)
+            with self.assertRaises(jwe.InvalidJWEData):
+                other.decrypt(removed)
+
+    def test_rekey_ecdh_and_pbes2(self):
+        for alg, key, newkey in (
+                ('ECDH-ES+A256KW',
+                 jwk.JWK.generate(kty='EC', crv='P-256'),
+                 jwk.JWK.generate(kty='EC', crv='P-256')),
+                ('PBES2-HS256+A128KW',
+                 jwk.JWK.from_password('old-password'),
+                 jwk.JWK.from_password('new-password'))):
+            if alg.startswith('PBES2'):
+                protected = {'alg': alg, 'enc': 'A128GCM', 'p2c': 1024,
+                             'p2s': base64url_encode(b'p' * 16)}
+            else:
+                protected = {'alg': alg, 'enc': 'A128GCM'}
+            e = jwe.JWE(plaintext=b'rekey-alg', protected=protected)
+            e.add_recipient(key)
+            new_token = e.rekey(key, newkey).serialize()
+            check = jwe.JWE()
+            check.deserialize(new_token, newkey)
+            self.assertEqual(check.payload, b'rekey-alg')
+
     def test_jwe_zip_in_unprotected_header(self):
         payload = b'test-zip'
         key = jwk.JWK.generate(kty='oct', size=128)

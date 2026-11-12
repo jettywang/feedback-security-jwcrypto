@@ -19,6 +19,8 @@ Variables
 
 .. autodata:: jwcrypto.jwe.default_allowed_algs
 
+.. autodata:: jwcrypto.jwe.rekey_keymgmt_algs
+
 Exceptions
 ----------
 
@@ -70,6 +72,35 @@ Decrypt a JWE token::
     >>> jwetoken.deserialize(enc)
     >>> jwetoken.decrypt(key)
     >>> payload = jwetoken.payload
+
+Re-key a recipient
+~~~~~~~~~~~~~~~~~~
+
+Re-keying authenticates the token with the current key and then wraps the
+existing content encryption key for a new recipient.  The protected header,
+AAD, IV, ciphertext and tag are reused byte-for-byte; the plaintext is not
+re-encrypted.  ``rekey`` returns a new token object and leaves the original
+one unchanged; existing recipients are replaced by the new one.
+
+The key management algorithm must be one listed in
+``jwe.rekey_keymgmt_algs``.  Algorithms that derive the CEK from the
+recipient key (``dir`` and bare ``ECDH-ES``) cannot be used, and neither can
+``RSA1_5``.  Changing the protected header (including ``alg`` or ``enc``) is
+rejected::
+
+    >>> from jwcrypto import jwk, jwe
+    >>> old_key = jwk.JWK.generate(kty='oct', size=256)
+    >>> new_key = jwk.JWK.generate(kty='oct', size=256)
+    >>> jwetoken = jwe.JWE(b'My Encrypted message',
+    ...                    {"alg": "A256KW", "enc": "A256GCM"})
+    >>> jwetoken.add_recipient(old_key)
+    >>> enc = jwetoken.serialize()
+    >>> rewrapped = jwetoken.rekey(old_key, new_key)
+    >>> new_enc = rewrapped.serialize()
+    >>> check = jwe.JWE()
+    >>> check.deserialize(new_enc, new_key)
+    >>> check.payload
+    b'My Encrypted message'
 
 Asymmetric keys
 ~~~~~~~~~~~~~~~
