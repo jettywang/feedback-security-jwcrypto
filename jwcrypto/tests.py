@@ -1117,6 +1117,140 @@ class TestJWS(unittest.TestCase):
         with self.assertRaises(InvalidJWSERegOperation):
             jws.JWS(A6_example['payload'], header_registry=newreg)
 
+    def test_customhdr_registry_isolation(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        payload = b'per-context policy'
+        protected = {'alg': 'HS256', 'crit': ['custom1'], 'custom1': 'ok'}
+
+        def chk(jwobj):
+            return jwobj.jose_header['custom1'] == 'ok'
+
+        reg_a = {'custom1': JWSEHeaderParameter('ext', True, True, chk)}
+        signer = jws.JWS(payload, header_registry=reg_a)
+        signer.add_signature(key, protected=protected)
+        token = signer.serialize()
+
+        a = jws.JWS(header_registry=reg_a)
+        a.deserialize(token)
+        a.verify(key)
+        self.assertTrue(a.is_valid)
+
+        b = jws.JWS()
+        b.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            b.verify(key)
+        self.assertFalse(b.is_valid)
+
+        # Interleaving the same token must not leak policy between contexts.
+        a.verify(key)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            b.verify(key)
+
+        # Mutating A after B exists must not change B.
+        a.header_registry['custom1'] = \
+            JWSEHeaderParameter('ext', True, True, None)
+        a.verify(key)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            b.verify(key)
+
+        # A per-call policy is an isolated snapshot, not object state.
+        d = jws.JWS()
+        d.deserialize(token)
+        d.verify(key, header_registry=reg_a)
+        self.assertNotIn('custom1', d.header_registry)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            d.verify(key)
+
+    def test_customhdr_handler_rejections(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        payload = b'handler failures'
+        protected = {'alg': 'HS256', 'crit': ['custom1'], 'custom1': 'ok'}
+
+        def boom(jwobj):
+            raise RuntimeError('handler failure')
+
+        def false(jwobj):
+            return False
+
+        for handler in (boom, false):
+            reg = {'custom1': JWSEHeaderParameter('ext', True, True, handler)}
+            signer = jws.JWS(payload, header_registry=reg)
+            signer.add_signature(key, protected=protected)
+            token = signer.serialize()
+            verifier = jws.JWS(header_registry=reg)
+            verifier.deserialize(token)
+            with self.assertRaises(jws.InvalidJWSSignature):
+                verifier.verify(key)
+            self.assertFalse(verifier.is_valid)
+
+    def test_customhdr_must_protect(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        payload = b'must protect'
+        reg_a = {'custom1': JWSEHeaderParameter('ext', True, True, None)}
+
+        # The extension value cannot be carried in the unprotected header.
+        signer = jws.JWS(payload, header_registry=reg_a)
+        with self.assertRaises(jws.InvalidJWSObject):
+            signer.add_signature(
+                key,
+                protected={'alg': 'HS256', 'crit': ['custom1']},
+                header={'custom1': 'ok'})
+
+        # Handcraft the same shape and confirm verification rejects it even
+        # when the crit list itself is protected.
+        core = jws.JWSCore('HS256', key,
+                           json_encode({'alg': 'HS256',
+                                        'crit': ['custom1']}), payload)
+        sig = core.sign()
+        crafted = json_encode({
+            'payload': base64url_encode(payload),
+            'protected': sig['protected'],
+            'header': {'custom1': 'ok'},
+            'signature': sig['signature'],
+        })
+        verifier = jws.JWS(header_registry=reg_a)
+        verifier.deserialize(crafted)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            verifier.verify(key)
+
+    def test_customhdr_handler_not_run_before_signature(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        calls = []
+
+        def chk(jwobj):
+            calls.append(jwobj.is_valid)
+            return jwobj.jose_header['custom1'] == 'ok'
+
+        reg = {'custom1': JWSEHeaderParameter('ext', True, True, chk)}
+        signer = jws.JWS(b'ordering',
+                         header_registry=reg)
+        signer.add_signature(
+            key, protected={'alg': 'HS256', 'crit': ['custom1'],
+                            'custom1': 'ok'})
+        token = signer.serialize(compact=True)
+
+        verifier = jws.JWS(header_registry=reg)
+        verifier.deserialize(token)
+        bad_sig = token.rsplit('.', 1)[0] + '.' + base64url_encode(b'\x00')
+        verifier.deserialize(bad_sig)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            verifier.verify(key)
+        self.assertEqual(calls, [])
+
+    def test_customhdr_standard_header_override(self):
+        # A standard header cannot be replaced by an extension, including a
+        # standard name owned by the sibling protocol.
+        newhdr = JWSEHeaderParameter('Alg override', False, True, None)
+        for name in ('alg', 'crit', 'b64'):
+            with self.assertRaises(InvalidJWSERegOperation):
+                jws.JWS(header_registry={name: newhdr})
+        with self.assertRaises(InvalidJWSERegOperation):
+            jws.JWS(header_registry={'enc': newhdr})
+        # Nor can it be deleted from the context registry.
+        s = jws.JWS()
+        with self.assertRaises(InvalidJWSERegOperation):
+            del s.header_registry['alg']
+
     def test_EdDsa_signing_and_verification(self):
         examples = []
         if 'Ed25519' in jwk.ImplementedOkpCurves:
@@ -1599,6 +1733,92 @@ class TestJWE(unittest.TestCase):
         newreg = {'alg': newhdr}
         with self.assertRaises(InvalidJWSERegOperation):
             jwe.JWE(header_registry=newreg)
+
+    def test_customhdr_jwe_isolation_and_tamper(self):
+        payload = b'jwe per-context policy'
+        key = jwk.JWK.generate(kty='oct', size=128)
+        protected = {'alg': 'A128KW', 'enc': 'A128GCM',
+                     'crit': ['custom1'], 'custom1': 'ok'}
+
+        def chk(jwobj):
+            return jwobj.jose_header['custom1'] == 'ok'
+
+        reg_a = {'custom1': JWSEHeaderParameter('ext', True, True, chk)}
+        enc = jwe.JWE(payload, protected, header_registry=reg_a)
+        enc.add_recipient(key)
+        token = enc.serialize()
+
+        a = jwe.JWE(header_registry=reg_a)
+        a.deserialize(token)
+        a.decrypt(key)
+        self.assertEqual(a.payload, payload)
+
+        b = jwe.JWE()
+        b.deserialize(token)
+        with self.assertRaises(jwe.InvalidJWEData):
+            b.decrypt(key)
+
+        a.decrypt(key)
+        with self.assertRaises(jwe.InvalidJWEData):
+            b.decrypt(key)
+
+        # Mutating A's registry does not change the independent B context.
+        a.header_registry['custom1'] = \
+            JWSEHeaderParameter('ext', True, True, None)
+        a.decrypt(key)
+        with self.assertRaises(jwe.InvalidJWEData):
+            b.decrypt(key)
+
+        # A per-call policy snapshot leaves the object unchanged.
+        d = jwe.JWE()
+        d.deserialize(token)
+        d.decrypt(key, header_registry=reg_a)
+        self.assertNotIn('custom1', d.header_registry)
+        with self.assertRaises(jwe.InvalidJWEData):
+            d.decrypt(key)
+
+        # Tampering with the tag or ciphertext is never masked by a successful
+        # extension handler.
+        tampered_tag = json_decode(token)
+        tag = base64url_decode(tampered_tag['tag'])
+        tampered_tag['tag'] = base64url_encode(bytes([tag[0] ^ 1]) + tag[1:])
+        e = jwe.JWE(header_registry=reg_a)
+        e.deserialize(json_encode(tampered_tag))
+        with self.assertRaises(jwe.InvalidJWEData):
+            e.decrypt(key)
+
+        tampered_ct = json_decode(token)
+        ct = base64url_decode(tampered_ct['ciphertext'])
+        tampered_ct['ciphertext'] = base64url_encode(bytes([ct[0] ^ 1]) +
+                                                     ct[1:])
+        e = jwe.JWE(header_registry=reg_a)
+        e.deserialize(json_encode(tampered_ct))
+        with self.assertRaises(jwe.InvalidJWEData):
+            e.decrypt(key)
+
+    def test_customhdr_jwe_handler_not_run_before_tag(self):
+        key = jwk.JWK.generate(kty='oct', size=128)
+        calls = []
+
+        def chk(jwobj):
+            calls.append(jwobj.plaintext)
+            return True
+
+        reg = {'custom1': JWSEHeaderParameter('ext', True, True, chk)}
+        enc = jwe.JWE(b'ordering', {'alg': 'A128KW', 'enc': 'A128GCM',
+                                    'crit': ['custom1'], 'custom1': 'ok'},
+                      header_registry=reg)
+        enc.add_recipient(key)
+        token = enc.serialize()
+
+        o = json_decode(token)
+        tag = base64url_decode(o['tag'])
+        o['tag'] = base64url_encode(bytes([tag[0] ^ 1]) + tag[1:])
+        d = jwe.JWE(header_registry=reg)
+        d.deserialize(json_encode(o))
+        with self.assertRaises(jwe.InvalidJWEData):
+            d.decrypt(key)
+        self.assertEqual(calls, [])
 
     def test_X25519_ECDH(self):
         plaintext = b"plain"

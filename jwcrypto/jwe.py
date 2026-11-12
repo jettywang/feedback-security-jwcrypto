@@ -6,6 +6,7 @@ from jwcrypto import common
 from jwcrypto.common import InvalidJWSEHeader
 from jwcrypto.common import JWKeyNotFound
 from jwcrypto.common import JWSEHeaderParameter, JWSEHeaderRegistry
+from jwcrypto.common import STANDARD_HEADER_NAMES
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import check_crit, merge_headers, validate_headers
 from jwcrypto.common import json_decode, json_encode
@@ -87,6 +88,10 @@ class JWE:
         self.objects = {}
         self.plaintext = None
         self.header_registry = JWSEHeaderRegistry(JWEHeaderRegistry)
+        # A JWE extension must not claim names owned by the sibling protocol
+        # (for example the JWS "b64" parameter).
+        self.header_registry.reserve(STANDARD_HEADER_NAMES)
+        self._active_registry = None
         self.flattened = flattened
         if header_registry:
             self.header_registry.update(header_registry)
@@ -156,7 +161,9 @@ class JWE:
         except InvalidJWSEHeader as e:
             raise InvalidJWEData(str(e)) from e
 
-    def _get_jose_header(self, header=None):
+    def _get_jose_header(self, header=None, registry=None):
+        if registry is None:
+            registry = self._active_registry or self.header_registry
         ph = json_decode(self.objects.get('protected', '{}'))
         uh = json_decode(self.objects.get('unprotected', '{}'))
         rh = None
@@ -166,8 +173,9 @@ class JWE:
             else:
                 rh = json_decode(header)
         try:
-            jh = merge_headers(ph, uh, rh, registry=self.header_registry)
-            check_crit(jh, ph, registry=self.header_registry)
+            jh = merge_headers(ph, uh, rh, registry=registry)
+            check_crit(jh, ph, registry=registry,
+                       require_protected_values=True)
             return jh
         except InvalidJWSEHeader as e:
             raise InvalidJWEData(str(e)) from e
@@ -357,15 +365,15 @@ class JWE:
         return data
 
     # FIXME: allow to specify which algorithms to accept as valid
-    def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size):
+    def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size,
+                 registry=None):
+        if registry is None:
+            registry = self._active_registry or self.header_registry
 
-        jh = self._get_jose_header(ppe.get('header', None))
-
-        # TODO: allow caller to specify list of headers it understands
-        try:
-            validate_headers(jh, registry=self.header_registry, target=self)
-        except InvalidJWSEHeader as e:
-            raise InvalidJWEData(str(e)) from e
+        # Parse and structurally check the merged headers.  Extension
+        # handlers are not invoked yet: nothing here is authenticated until
+        # the tag is verified below.
+        jh = self._get_jose_header(ppe.get('header', None), registry=registry)
 
         alg = self._jwa_keymgmt(jh.get('alg', None))
         enc = self._jwa_enc(jh.get('enc', None))
@@ -407,6 +415,14 @@ class JWE:
                                         self.objects['ciphertext'],
                                         self.objects['tag'])
 
+        # The tag has now authenticated the protected header (it is part of
+        # the AAD), so extension handlers may run.  They must not run during
+        # parsing: unprotected headers are not authenticated.
+        try:
+            validate_headers(jh, registry=registry, target=self)
+        except InvalidJWSEHeader as e:
+            raise InvalidJWEData(str(e)) from e
+
         compress = jh.get('zip', None)
         if compress == 'DEF':
             if len(data) > default_max_compressed_size:
@@ -425,7 +441,7 @@ class JWE:
         else:
             raise ValueError('Unknown compression')
 
-    def decrypt(self, key, max_plaintext=0):
+    def decrypt(self, key, max_plaintext=0, header_registry=None):
         """Decrypt a JWE token.
 
         :param key: The (:class:`jwcrypto.jwk.JWK`) decryption key.
@@ -436,6 +452,10 @@ class JWE:
          the library default applies. Application writers are recommended
          to set a limit here if they know what is the max plaintext size
          for their application.
+        :param header_registry: An optional :class:`JWSEHeaderRegistry`
+         containing additional extension header rules for this call. The
+         object's registry is left unchanged, so different decryption
+         contexts cannot affect each other.
 
         :raises InvalidJWEOperation: if the key is not a JWK object.
         :raises InvalidJWEData: if the ciphertext can't be decrypted or
@@ -443,15 +463,29 @@ class JWE:
         :raises JWKeyNotFound: if key is a JWKSet and the key is not found.
         """
 
+        registry = self._verification_registry(header_registry)
+        self._active_registry = registry
         self.plaintext = None
         if max_plaintext == 0:
             max_plaintext = default_max_plaintext_size
-
         if 'ciphertext' not in self.objects:
             raise InvalidJWEOperation("No available ciphertext")
         self.decryptlog = []
         missingkey = False
 
+        try:
+            missingkey = self._decrypt_obj(key, max_plaintext, registry)
+        finally:
+            self._active_registry = None
+
+        if not self.plaintext:
+            if missingkey:
+                raise JWKeyNotFound("Key Not found in JWKSet")
+            raise InvalidJWEData('No recipient matched the provided '
+                                 'key' + repr(self.decryptlog))
+
+    def _decrypt_obj(self, key, max_plaintext, registry):
+        missingkey = False
         if 'recipients' in self.objects:
             if len(self.objects['recipients']) > default_max_recipients:
                 raise InvalidJWEData(
@@ -459,7 +493,8 @@ class JWE:
                     len(self.objects['recipients']))
             for rec in self.objects['recipients']:
                 try:
-                    self._decrypt(key, rec, max_plaintext=max_plaintext)
+                    self._decrypt(key, rec, max_plaintext=max_plaintext,
+                                  registry=registry)
                     # Stop after the first successful recipient.
                     if self.plaintext is not None:
                         break
@@ -469,17 +504,22 @@ class JWE:
                     self.decryptlog.append('Failed: [%s]' % repr(e))
         else:
             try:
-                self._decrypt(key, self.objects, max_plaintext=max_plaintext)
+                self._decrypt(key, self.objects, max_plaintext=max_plaintext,
+                              registry=registry)
             except Exception as e:  # pylint: disable=broad-except
                 if isinstance(e, JWKeyNotFound):
                     missingkey = True
                 self.decryptlog.append('Failed: [%s]' % repr(e))
 
-        if not self.plaintext:
-            if missingkey:
-                raise JWKeyNotFound("Key Not found in JWKSet")
-            raise InvalidJWEData('No recipient matched the provided '
-                                 'key' + repr(self.decryptlog))
+        return missingkey
+
+    def _verification_registry(self, header_registry):
+        """Build an isolated policy snapshot for one decryption call."""
+        if header_registry is None:
+            return self.header_registry
+        registry = self.header_registry.copy()
+        registry.update(header_registry)
+        return registry
 
     def deserialize(self, raw_jwe, key=None):
         """Deserialize a JWE token.

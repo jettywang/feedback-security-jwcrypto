@@ -3,6 +3,7 @@
 from jwcrypto.common import InvalidJWSEHeader
 from jwcrypto.common import JWException, JWKeyNotFound
 from jwcrypto.common import JWSEHeaderParameter, JWSEHeaderRegistry
+from jwcrypto.common import STANDARD_HEADER_NAMES
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import check_crit, merge_headers, validate_headers
 from jwcrypto.common import json_decode, json_encode
@@ -201,7 +202,11 @@ class JWS:
         self.objects['payload'] = payload
         self.verifylog = None
         self._allowed_algs = None
+        self._active_registry = None
         self.header_registry = JWSEHeaderRegistry(JWSHeaderRegistry)
+        # Reserve names owned by the sibling protocol too: a JWS extension
+        # must not claim, for example, the JWE "enc" parameter.
+        self.header_registry.reserve(STANDARD_HEADER_NAMES)
         if header_registry:
             self.header_registry.update(header_registry)
 
@@ -228,18 +233,24 @@ class JWS:
     def is_valid(self):
         return self.objects.get('valid', False)
 
-    # TODO: allow caller to specify list of headers it understands
-    def _merge_check_headers(self, protected, unprotected):
+    def _merge_check_headers(self, protected, unprotected, registry=None):
+        if registry is None:
+            registry = self._active_registry or self.header_registry
         try:
             merged = merge_headers(protected, unprotected,
-                                   registry=self.header_registry)
-            check_crit(merged, protected, registry=self.header_registry)
-            validate_headers(merged)
+                                   registry=registry)
+            check_crit(merged, protected, registry=registry,
+                       require_protected_values=True)
+            # Structural checks only.  Extension handlers must never see
+            # header data before the signature below has been verified.
+            validate_headers(merged, registry=registry, target=self,
+                             run_handlers=False)
             return merged
         except InvalidJWSEHeader as e:
             raise InvalidJWSObject(str(e)) from e
 
     def _verify(self, alg, key, payload, signature, protected, unprotected):
+        registry = self._active_registry or self.header_registry
         p = {}
         # verify it is a valid JSON object and decode
         if protected is not None:
@@ -251,13 +262,9 @@ class JWS:
             if not isinstance(unprotected, dict):
                 raise InvalidJWSSignature('Invalid Unprotected header')
 
-        # Merge and check (critical) headers
-        chk_hdrs = self._merge_check_headers(p, unprotected)
-        try:
-            validate_headers(chk_hdrs, registry=self.header_registry,
-                             target=self)
-        except InvalidJWSEHeader as e:
-            raise InvalidJWSSignature(str(e)) from e
+        # Merge and check (critical) headers.  This is structural only: no
+        # extension handler runs here, before the signature is verified.
+        chk_hdrs = self._merge_check_headers(p, unprotected, registry=registry)
 
         # check 'alg' is present
         if alg is None and 'alg' not in chk_hdrs:
@@ -278,6 +285,12 @@ class JWS:
             signer = JWSCore(resulting_alg, key, protected,
                              payload, self._allowed_algs)
             signer.verify(signature)
+            # Only now, after the signature binds the protected header, may
+            # extension handlers inspect the token.
+            try:
+                validate_headers(chk_hdrs, registry=registry, target=self)
+            except InvalidJWSEHeader as e:
+                raise InvalidJWSSignature(str(e)) from e
             self.verifylog.append("Success")
         elif isinstance(key, JWKSet):
             keys = key
@@ -303,6 +316,13 @@ class JWS:
                                           keyid, repr(e)))
             if "Success" not in self.verifylog:
                 raise JWKeyNotFound('No working key found in key set')
+            # Run extension handlers only once a key has authenticated the
+            # token; a handler failure is an invalid signature, not a
+            # reason to probe more keys.
+            try:
+                validate_headers(chk_hdrs, registry=registry, target=self)
+            except InvalidJWSEHeader as e:
+                raise InvalidJWSSignature(str(e)) from e
         else:
             raise ValueError("Unrecognized key type")
 
@@ -317,7 +337,8 @@ class JWS:
                                           ' Detached Payload provided')
         return op
 
-    def verify(self, key, alg=None, detached_payload=None):
+    def verify(self, key, alg=None, detached_payload=None,
+               header_registry=None):
         """Verifies a JWS token.
 
         :param key: A (:class:`jwcrypto.jwk.JWK`) verification or
@@ -327,6 +348,10 @@ class JWS:
             is known as it is provided with the JOSE Headers of the token.
         :param detached_payload: A detached payload to verify the signature
             against. Only valid for tokens that are not carrying a payload.
+        :param header_registry: An optional :class:`JWSEHeaderRegistry`
+            containing additional extension header rules for this call.
+            The object's registry is left unchanged, so different
+            verification contexts cannot affect each other.
 
         :raises InvalidJWSSignature: if the verification fails.
         :raises InvalidJWSOperation: if a detached_payload is provided but
@@ -334,9 +359,23 @@ class JWS:
         :raises JWKeyNotFound: if key is a JWKSet and the key is not found.
         """
 
+        registry = self._verification_registry(header_registry)
+        self._active_registry = registry
         self.verifylog = []
         self.objects['valid'] = False
         obj = self.objects
+        try:
+            missingkey = self._verify_obj(obj, alg, key, detached_payload)
+        finally:
+            self._active_registry = None
+
+        if not self.is_valid:
+            if missingkey:
+                raise JWKeyNotFound('No working key found in key set')
+            raise InvalidJWSSignature('Verification failed for all '
+                                      'signatures' + repr(self.verifylog))
+
+    def _verify_obj(self, obj, alg, key, detached_payload):
         missingkey = False
         if 'signature' in obj:
             payload = self._get_obj_payload(obj, detached_payload)
@@ -370,11 +409,15 @@ class JWS:
         else:
             raise InvalidJWSSignature('No signatures available')
 
-        if not self.is_valid:
-            if missingkey:
-                raise JWKeyNotFound('No working key found in key set')
-            raise InvalidJWSSignature('Verification failed for all '
-                                      'signatures' + repr(self.verifylog))
+        return missingkey
+
+    def _verification_registry(self, header_registry):
+        """Build an isolated policy snapshot for one verification call."""
+        if header_registry is None:
+            return self.header_registry
+        registry = self.header_registry.copy()
+        registry.update(header_registry)
+        return registry
 
     def _deserialize_signature(self, s):
         o = {'signature': base64url_decode(str(s['signature']))}
