@@ -1,8 +1,10 @@
 # Copyright (C) 2015  JWCrypto Project Contributors - see LICENSE file
 
 import os
+import time
 from binascii import hexlify, unhexlify
 from collections import namedtuple
+from collections.abc import Mapping
 from enum import Enum
 
 from cryptography import x509
@@ -358,6 +360,75 @@ class InvalidJWKValue(JWException):
     context of an operation that requires specific values to be used based
     on the key type or other constraints.
     """
+
+
+# Bounds applied to untrusted RSA material before any expensive math is
+# attempted. Recovery itself relies on the bounded routine provided by the
+# 'cryptography' dependency, which never performs more than
+# rsa._MAX_RECOVERY_ATTEMPTS iterations; no factoring algorithm is
+# implemented in this module.
+RSA_MIN_MODULUS_BITS = 512
+"""Smallest RSA modulus length, in bits, accepted from untrusted input."""
+
+RSA_MAX_MODULUS_BITS = 4096
+"""Default upper bound, in bits, for an untrusted RSA modulus."""
+
+RSA_RECOVERY_DEADLINE_SECONDS = 5.0
+"""Default wall-clock budget for one bounded factor recovery attempt."""
+
+
+class RSAKeyMaterialError(InvalidJWKValue):
+    """Base exception for the restricted RSA private material entry point.
+
+    Every rejection raised by :meth:`JWK.from_rsa_private_material` (and
+    the matching :meth:`JWK.import_rsa_private_material`) carries an
+    explanatory :attr:`stage` naming the processing phase at which the
+    untrusted input was refused:
+
+    * ``parse``: malformed Base64urlUInt encoding or missing n/e/d
+    * ``bounds``: integer length or recovery-cost budget exceeded
+    * ``consistency``: n/e/d mismatch or contradictory CRT fragments
+    * ``recovery``: the bounded dependency routine could not derive p, q
+    * ``validation``: the fully assembled key failed cryptographic checks
+    """
+
+    stage = 'unknown'
+
+    def __init__(self, message=None, *, stage=None):
+        super(RSAKeyMaterialError, self).__init__()
+        self.value = message
+        if stage is not None:
+            self.stage = stage
+
+    def __str__(self):
+        if self.value is None:
+            return 'RSA key material rejected at stage "%s"' % self.stage
+        return 'RSA key material rejected at stage "%s": %s' % (
+            self.stage, self.value)
+
+
+class RSAMaterialBoundsError(RSAKeyMaterialError):
+    """An untrusted RSA integer exceeds the configured length or budget."""
+
+    stage = 'bounds'
+
+
+class RSAMaterialConsistencyError(RSAKeyMaterialError):
+    """Supplied RSA parameters are mutually contradictory."""
+
+    stage = 'consistency'
+
+
+class RSAMaterialRecoveryError(RSAKeyMaterialError):
+    """The bounded dependency routine could not recover the prime factors."""
+
+    stage = 'recovery'
+
+
+class RSAKeyValidationError(RSAKeyMaterialError):
+    """The assembled RSA private key failed cryptographic validation."""
+
+    stage = 'validation'
 
 
 class JWK(dict):
@@ -1202,6 +1273,300 @@ class JWK(dict):
         obj = cls()
         obj.import_from_pyca(key)
         return obj
+
+    # Names of the private RSA parameters, in the order used to build a
+    # fully populated key.
+    _RSA_PRIVATE_PARAMS = ('p', 'q', 'dp', 'dq', 'qi')
+
+    @staticmethod
+    def _rsa_material_int(name, value):
+        """Decode one Base64urlUInt JWK integer from untrusted input."""
+        if not isinstance(value, str):
+            raise RSAKeyMaterialError(
+                '"%s" must be a Base64urlUInt string' % name, stage='parse')
+        try:
+            return int(hexlify(base64url_decode(value)), 16)
+        except Exception as e:  # pylint: disable=broad-except
+            raise RSAKeyMaterialError(
+                '"%s" is not Base64urlUInt encoded' % name,
+                stage='parse') from e
+
+    @classmethod
+    def _prepare_rsa_private_materials(
+            cls, materials, max_modulus_bits, deadline):
+        """Validate untrusted RSA material and return a complete JWK dict.
+
+        No state of any live JWK object is touched here: all parsing,
+        bounded recovery and cryptographic validation happen on local
+        variables, so a failure cannot leave a half usable key behind or
+        poison an existing key cache.
+
+        :raises RSAKeyMaterialError: on any malformed, out of bounds,
+            contradictory or unvalidatable input, with ``.stage`` naming
+            the processing phase that rejected it.
+        """
+        if not isinstance(materials, dict):
+            raise RSAKeyMaterialError(
+                'RSA private materials must be provided as a mapping',
+                stage='parse')
+
+        kty = materials.get('kty')
+        if kty is not None and kty != 'RSA':
+            raise InvalidJWKType(kty)
+        if 'oth' in materials:
+            raise RSAKeyMaterialError(
+                'Multi-prime ("oth") RSA keys are not supported',
+                stage='parse')
+
+        for required in ('n', 'e', 'd'):
+            if required not in materials:
+                raise RSAKeyMaterialError(
+                    'Missing required value "%s"' % required, stage='parse')
+
+        n = cls._rsa_material_int('n', materials['n'])
+        e = cls._rsa_material_int('e', materials['e'])
+        d = cls._rsa_material_int('d', materials['d'])
+
+        fragments = {}
+        for name in cls._RSA_PRIVATE_PARAMS:
+            if name in materials and materials[name] is not None:
+                fragments[name] = cls._rsa_material_int(
+                    name, materials[name])
+
+        # ---- Stage: bounds on untrusted integer lengths and budget ----
+        if not isinstance(max_modulus_bits, int) or max_modulus_bits <= 0:
+            raise RSAMaterialBoundsError(
+                'max_modulus_bits must be a positive integer')
+        if not isinstance(deadline, (int, float)) or deadline < 0:
+            raise RSAMaterialBoundsError(
+                'deadline must be a non-negative number of seconds')
+
+        modulus_bits = n.bit_length()
+        if modulus_bits < RSA_MIN_MODULUS_BITS:
+            raise RSAMaterialBoundsError(
+                'Modulus is %d bits; minimum accepted is %d bits'
+                % (modulus_bits, RSA_MIN_MODULUS_BITS))
+        if modulus_bits > max_modulus_bits:
+            raise RSAMaterialBoundsError(
+                'Modulus is %d bits; configured limit is %d bits'
+                % (modulus_bits, max_modulus_bits))
+        if n <= 1 or n % 2 == 0:
+            raise RSAMaterialBoundsError(
+                'Modulus n must be an odd integer greater than 1')
+        if e < 3 or e % 2 == 0 or e >= n:
+            raise RSAMaterialBoundsError(
+                'Public exponent e must be odd with 3 <= e < n')
+        if d <= 1 or d >= n:
+            raise RSAMaterialBoundsError(
+                'Private exponent d must satisfy 1 < d < n')
+        for name, value in fragments.items():
+            if value <= 1:
+                raise RSAMaterialBoundsError(
+                    '"%s" must be a positive integer' % name)
+
+        # ---- Stage: consistency of the core (n, e, d) triple ----
+        if pow(17, e * d, n) != 17:
+            raise RSAMaterialConsistencyError(
+                'Private exponent d does not match the public (n, e) pair')
+
+        have_p = 'p' in fragments
+        have_q = 'q' in fragments
+        if have_p and have_q:
+            p = fragments['p']
+            q = fragments['q']
+            if p * q != n:
+                raise RSAMaterialConsistencyError(
+                    'Supplied primes p and q do not multiply to n')
+            if p < q:
+                # Keep the canonical ordering expected by RSAPrivateNumbers
+                p, q = q, p
+        elif have_p != have_q:
+            # A single prime is never trusted blindly: recover both primes
+            # from the bounded dependency routine and cross-check.
+            supplied_p = fragments['p'] if have_p else fragments['q']
+            p, q = cls._recover_rsa_primes(n, e, d, deadline)
+            if supplied_p not in (p, q):
+                raise RSAMaterialConsistencyError(
+                    'Supplied prime factor does not match (n, e, d)')
+        else:
+            p, q = cls._recover_rsa_primes(n, e, d, deadline)
+
+        # Canonical CRT material derived through the dependency helpers.
+        p, q, dp, dq, qi = cls._build_canonical_rsa_crt(n, e, d, p, q)
+        canonical = {'p': p, 'q': q, 'dp': dp, 'dq': dq, 'qi': qi}
+
+        # Any fragment supplied by the caller must agree with the canonical
+        # material, otherwise it is a contradictory parameter and the key
+        # is rejected rather than silently overwriting the fragment.
+        for name, value in fragments.items():
+            if value != canonical[name]:
+                raise RSAMaterialConsistencyError(
+                    'Supplied "%s" is inconsistent with (n, e, d)' % name)
+
+        # ---- Stage: full cryptographic validation of the assembled key ----
+        pri_key = cls._validate_rsa_private_key(n, e, d, p, q, dp, dq, qi)
+
+        return pri_key, {
+            'n': n, 'e': e, 'd': d,
+            'p': p, 'q': q, 'dp': dp, 'dq': dq, 'qi': qi,
+        }
+
+    @staticmethod
+    def _build_canonical_rsa_crt(n, e, d, p, q):
+        """Derive ordered primes and CRT parameters via dependency helpers."""
+        if p < q:
+            # Keep the canonical ordering expected by RSAPrivateNumbers
+            p, q = q, p
+        if p * q != n:
+            raise RSAMaterialConsistencyError(
+                'Recovered primes do not multiply to n')
+        dp = rsa.rsa_crt_dmp1(d, p)
+        dq = rsa.rsa_crt_dmq1(d, q)
+        qi = rsa.rsa_crt_iqmp(p, q)
+        return p, q, dp, dq, qi
+
+    @staticmethod
+    def _validate_rsa_private_key(n, e, d, p, q, dp, dq, qi):
+        """Run the full cryptographic checks without skipping validation."""
+        pub_nums = rsa.RSAPublicNumbers(e, n)
+        pri_nums = rsa.RSAPrivateNumbers(
+            p, q, d, dp, dq, qi, pub_nums)
+        try:
+            return pri_nums.private_key(default_backend())
+        except (ValueError, TypeError) as exc:
+            raise RSAKeyValidationError(str(exc)) from exc
+
+    @staticmethod
+    def _recover_rsa_primes(n, e, d, deadline):
+        """Call the bounded dependency routine without factoring ourselves.
+
+        The 'cryptography' routine is randomized but capped at
+        ``rsa._MAX_RECOVERY_ATTEMPTS`` iterations per call. A zero deadline
+        rejects the operation before any math is attempted, and a positive
+        deadline bounds the wall time spent in the single bounded call.
+        """
+        if deadline == 0:
+            raise RSAMaterialBoundsError(
+                'Recovery budget is zero; prime recovery not permitted')
+        started = time.monotonic()
+        try:
+            p, q = rsa.rsa_recover_prime_factors(n, e, d)
+        except ValueError as exc:
+            message = str(exc)
+            if 'don\'t match' in message:
+                raise RSAMaterialConsistencyError(message) from exc
+            raise RSAMaterialRecoveryError(message) from exc
+        if time.monotonic() - started > deadline:
+            raise RSAMaterialBoundsError(
+                'Recovery deadline of %s seconds exceeded' % deadline)
+        return p, q
+
+    @classmethod
+    def from_rsa_private_material(
+            cls, materials=None, *, max_modulus_bits=RSA_MAX_MODULUS_BITS,
+            deadline=RSA_RECOVERY_DEADLINE_SECONDS, **kwargs):
+        """Build a fully validated RSA private JWK from restricted material.
+
+        The restricted entry point accepts an RSA private JWK that carries
+        only the public ``n``, ``e`` and the private exponent ``d`` (plus
+        optional CRT fragments) and fills in the internal prime and CRT
+        material using the bounded primitives of the installed
+        'cryptography' dependency. No integer factoring algorithm is
+        implemented here, and
+        :attr:`JWK.unsafe_skip_rsa_key_validation` is never enabled.
+
+        Three parameter contracts are defined:
+
+        * **Complete CRT** - all of ``p``, ``q``, ``dp``, ``dq`` and
+          ``qi`` are present and mutually consistent: no prime recovery is
+          performed; every supplied value is cross-checked.
+        * **Fully absent CRT** - only ``n``, ``e`` and ``d`` are present:
+          the primes are recovered through one bounded dependency call and
+          the CRT parameters are derived from them.
+        * **Partial or contradictory CRT** - any subset of the CRT
+          parameters is accepted only if it agrees with the canonical
+          values derived from ``(n, e, d)``; a mismatch is rejected at the
+          ``consistency`` stage.
+
+        :param materials: a mapping of Base64urlUInt-encoded JWK RSA
+            parameters, or a JSON JWK string/bytes. Keyword arguments may
+            be supplied instead (or to override mapping entries).
+        :param max_modulus_bits: upper bound for the modulus length of an
+            untrusted key; defaults to
+            :data:`RSA_MAX_MODULUS_BITS`.
+        :param deadline: wall-clock budget in seconds for the bounded
+            prime recovery; ``0`` forbids recovery entirely.
+        :param \\**kwargs: additional JWK parameters (for example ``kid``,
+            ``use`` or ``key_ops``) and/or individual RSA parameters.
+
+        :return: a JWK holding the complete, validated RSA private key.
+        :rtype: JWK
+
+        :raises RSAKeyMaterialError: with a ``.stage`` attribute of
+            ``parse``, ``bounds``, ``consistency``, ``recovery`` or
+            ``validation`` describing where the input was refused. The
+            object is only constructed after every check succeeds, so a
+            failure never leaves a partially usable key.
+        """
+        obj = cls()
+        obj.import_rsa_private_material(
+            materials, max_modulus_bits=max_modulus_bits,
+            deadline=deadline, **kwargs)
+        return obj
+
+    def import_rsa_private_material(
+            self, materials=None, *, max_modulus_bits=RSA_MAX_MODULUS_BITS,
+            deadline=RSA_RECOVERY_DEADLINE_SECONDS, **kwargs):
+        """Import restricted RSA private material into an existing JWK.
+
+        See :meth:`from_rsa_private_material` for the parameter contracts,
+        bounds and exception stages. Validation runs entirely before the
+        current JWK contents are replaced; on failure the existing key and
+        its cached key objects are left untouched.
+        """
+        if materials is None:
+            merged = {}
+        elif isinstance(materials, (bytes, str)):
+            try:
+                merged = json_decode(materials)
+            except Exception as e:  # pylint: disable=broad-except
+                raise RSAKeyMaterialError(
+                    'RSA materials are not valid JSON',
+                    stage='parse') from e
+        elif isinstance(materials, Mapping):
+            merged = dict(materials)
+        else:
+            raise RSAKeyMaterialError(
+                'RSA private materials must be provided as a mapping',
+                stage='parse')
+        merged.update(kwargs)
+
+        # Validate everything on local state first.
+        pri_key, ints = self._prepare_rsa_private_materials(
+            merged, max_modulus_bits, deadline)
+
+        # Snapshot the live key so it can be restored if the final import
+        # unexpectedly fails; caches are only repopulated on success.
+        snapshot = dict(self)
+        cached_pub = self._cache_pub_k
+        cached_pri = self._cache_pri_k
+        try:
+            params = {'kty': 'RSA'}
+            for name, value in ints.items():
+                params[name] = self._encode_int(value)
+            for name, value in merged.items():
+                if name in ('kty', 'oth') or name in ints:
+                    continue
+                params[name] = value
+            self.import_key(**params)
+            self._cache_pub_k = pri_key.public_key()
+            self._cache_pri_k = pri_key
+        except (InvalidJWKType, InvalidJWKValue):
+            self.clear()
+            self.update(snapshot)
+            self._cache_pub_k = cached_pub
+            self._cache_pri_k = cached_pri
+            raise
 
     @classmethod
     def from_pem(cls, data, password=None):

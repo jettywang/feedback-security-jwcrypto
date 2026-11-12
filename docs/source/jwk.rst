@@ -37,6 +37,26 @@ Exceptions
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jwk.RSAKeyMaterialError
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwk.RSAMaterialBoundsError
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwk.RSAMaterialConsistencyError
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwk.RSAMaterialRecoveryError
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwk.RSAKeyValidationError
+   :members:
+   :show-inheritance:
+
 Registries
 ----------
 
@@ -56,6 +76,15 @@ Registries
    :annotation:
 
 .. autodata:: jwcrypto.jwk.JWKOperationsRegistry
+   :annotation:
+
+.. autodata:: jwcrypto.jwk.RSA_MIN_MODULUS_BITS
+   :annotation:
+
+.. autodata:: jwcrypto.jwk.RSA_MAX_MODULUS_BITS
+   :annotation:
+
+.. autodata:: jwcrypto.jwk.RSA_RECOVERY_DEADLINE_SECONDS
    :annotation:
 
 Examples
@@ -87,3 +116,12 @@ Import a P-256 Public Key::
 Import a Key from a PEM file::
     >>> with open("public.pem", "rb") as pemfile:  #doctest: +SKIP
     ...     key = jwk.JWK.from_pem(pemfile.read())
+
+Complete a minimal RSA private JWK (only ``n``, ``e`` and ``d``) into a
+fully validated key with its internal prime and CRT material recovered
+through the bounded primitives of the installed cryptography library::
+    >>> minimal = {"kty": "RSA", "n": n, "e": e, "d": d}  #doctest: +SKIP
+    >>> key = jwk.JWK.from_rsa_private_material(minimal)  #doctest: +SKIP
+    >>> key.thumbprint() == jwk.JWK(**full).thumbprint()  #doctest: +SKIP
+    True
+

@@ -1027,6 +1027,266 @@ customhdr_jws_example = \
     '}'
 
 
+class TestRSAPrivateMaterial(unittest.TestCase):
+    """Contracts for the restricted RSA private material entry point."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pyca_key = rsa.generate_private_key(65537, 2048, default_backend())
+        cls.full = jwk.JWK.from_pyca(cls.pyca_key).export_private(
+            as_dict=True)
+        cls.minimal = {name: cls.full[name] for name in ('kty', 'n', 'e', 'd')}
+
+    @staticmethod
+    def _b64_int(value):
+        return jwk.JWK()._encode_int(value)
+
+    @staticmethod
+    def _int(value):
+        return jwk.JWK()._decode_int(value)
+
+    def _pseudoprime_factors(self):
+        # Two large coprime Carmichael pseudoprimes: composite factors
+        # that satisfy the (n, e, d) consistency relation yet fail the
+        # cryptographic primality validation stage.
+        from functools import reduce
+        from math import gcd, lcm
+        from random import randint, randrange
+
+        def is_prime(number, rounds=20):
+            if number < 2:
+                return False
+            for small in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+                if number % small == 0:
+                    return number == small
+            dval = number - 1
+            shifts = 0
+            while dval % 2 == 0:
+                dval //= 2
+                shifts += 1
+            for _ in range(rounds):
+                base = randrange(2, number - 1)
+                witness = pow(base, dval, number)
+                if witness in (1, number - 1):
+                    continue
+                for _ in range(shifts - 1):
+                    witness = witness * witness % number
+                    if witness == number - 1:
+                        break
+                else:
+                    return False
+            return True
+
+        def carmichael(bits):
+            while True:
+                a = randint(1 << (bits // 3 - 6), 1 << (bits // 3 - 5))
+                p1 = 6 * a + 1
+                p2 = 12 * a + 1
+                p3 = 18 * a * a + 6 * a + 1
+                if is_prime(p1) and is_prime(p2) and is_prime(p3):
+                    number = p1 * p2 * p3
+                    if number.bit_length() >= bits:
+                        factors = {p1: 1, p2: 1, p3: 1}
+                        lam = reduce(lcm, (
+                            (p - 1) * p ** (exp - 1)
+                            for p, exp in factors.items()))
+                        return number, lam
+
+        m1, lam1 = carmichael(280)
+        m2, lam2 = carmichael(280)
+        while gcd(m1, m2) != 1:
+            m2, lam2 = carmichael(280)
+        return m1, m2, lcm(lam1, lam2)
+
+    def test_minimal_recovers_full_crt(self):
+        recovered = jwk.JWK.from_rsa_private_material(self.minimal)
+        for name in ('p', 'q', 'dp', 'dq', 'qi'):
+            self.assertEqual(recovered[name], self.full[name])
+        self.assertEqual(recovered.thumbprint(),
+                         jwk.JWK(**self.full).thumbprint())
+        self.assertFalse(recovered.unsafe_skip_rsa_key_validation)
+
+    def test_complete_crt_needs_no_recovery(self):
+        complete = jwk.JWK.from_rsa_private_material(self.full, deadline=0)
+        self.assertEqual(complete.export_private(as_dict=True), self.full)
+
+    def test_partial_crt_accepted_when_consistent(self):
+        partial = dict(self.minimal)
+        partial['dp'] = self.full['dp']
+        partial['qi'] = self.full['qi']
+        key = jwk.JWK.from_rsa_private_material(partial)
+        for name in ('p', 'q', 'dp', 'dq', 'qi'):
+            self.assertEqual(key[name], self.full[name])
+
+    def test_single_supplied_prime_cross_checked(self):
+        material = dict(self.minimal)
+        material['q'] = self.full['q']
+        key = jwk.JWK.from_rsa_private_material(material)
+        self.assertEqual(key['p'], self.full['p'])
+
+    def test_jws_full_and_minimal_share_fingerprint_and_verify(self):
+        complete = jwk.JWK(**self.full)
+        recovered = jwk.JWK.from_rsa_private_material(self.minimal)
+        self.assertEqual(complete.thumbprint(), recovered.thumbprint())
+
+        token = jws.JWS(b'crt-recovery')
+        token.add_signature(recovered, None, json_encode({'alg': 'RS256'}))
+        compact = token.serialize(compact=True)
+
+        verifier = jws.JWS()
+        verifier.deserialize(compact)
+        verifier.verify(complete.public())
+        self.assertEqual(verifier.payload, b'crt-recovery')
+
+    def test_jwe_decrypt_with_recovered_material(self):
+        complete = jwk.JWK(**self.full)
+        recovered = jwk.JWK.from_rsa_private_material(self.minimal)
+        self.assertEqual(complete.thumbprint(), recovered.thumbprint())
+
+        token = jwe.JWE(b'secret payload',
+                        json_encode({'alg': 'RSA-OAEP-256',
+                                     'enc': 'A256GCM'}))
+        token.add_recipient(complete.public())
+        compact = token.serialize(compact=True)
+
+        decrypted = jwe.JWE()
+        decrypted.deserialize(compact, recovered)
+        self.assertEqual(decrypted.payload, b'secret payload')
+
+    def test_public_export_never_contains_private_material(self):
+        recovered = jwk.JWK.from_rsa_private_material(self.minimal)
+        public = recovered.export_public(as_dict=True)
+        self.assertEqual(set(public), {'kty', 'n', 'e'})
+        public_json = recovered.export(private_key=False)
+        for name in ('d', 'p', 'q', 'dp', 'dq', 'qi'):
+            self.assertNotIn('"%s"' % name, public_json)
+
+    def test_bad_d_rejected_at_consistency_stage(self):
+        bad = dict(self.minimal)
+        bad['d'] = self._b64_int(self._int(bad['d']) ^ 1)
+        with self.assertRaises(jwk.RSAMaterialConsistencyError) as ctx:
+            jwk.JWK.from_rsa_private_material(bad)
+        self.assertEqual(ctx.exception.stage, 'consistency')
+
+    def test_contradictory_crt_rejected_at_consistency_stage(self):
+        bad = dict(self.full)
+        bad['qi'] = self._b64_int(self._int(bad['qi']) + 2)
+        with self.assertRaises(jwk.RSAMaterialConsistencyError) as ctx:
+            jwk.JWK.from_rsa_private_material(bad)
+        self.assertEqual(ctx.exception.stage, 'consistency')
+
+        bad = dict(self.minimal)
+        bad['p'] = self._b64_int(self._int(self.full['p']) + 2)
+        with self.assertRaises(jwk.RSAMaterialConsistencyError):
+            jwk.JWK.from_rsa_private_material(bad)
+
+    def test_malformed_and_missing_parameters_rejected_at_parse_stage(self):
+        bad = dict(self.minimal)
+        bad['n'] = 'not base64!!!'
+        with self.assertRaises(jwk.RSAKeyMaterialError) as ctx:
+            jwk.JWK.from_rsa_private_material(bad)
+        self.assertEqual(ctx.exception.stage, 'parse')
+
+        with self.assertRaises(jwk.RSAKeyMaterialError) as ctx:
+            jwk.JWK.from_rsa_private_material(
+                {name: self.minimal[name]
+                 for name in ('kty', 'n', 'e')})
+        self.assertEqual(ctx.exception.stage, 'parse')
+
+        bad = dict(self.minimal)
+        bad['oth'] = []
+        with self.assertRaises(jwk.RSAKeyMaterialError) as ctx:
+            jwk.JWK.from_rsa_private_material(bad)
+        self.assertEqual(ctx.exception.stage, 'parse')
+
+        with self.assertRaises(jwk.RSAKeyMaterialError) as ctx:
+            jwk.JWK.from_rsa_private_material(12345)
+        self.assertEqual(ctx.exception.stage, 'parse')
+
+        with self.assertRaises(jwk.InvalidJWKType):
+            jwk.JWK.from_rsa_private_material(
+                dict(self.minimal, kty='EC'))
+
+    def test_recovery_exhaustion_rejected_at_recovery_stage(self):
+        original = rsa.rsa_recover_prime_factors
+
+        def exhausted(n, e, d):
+            raise ValueError(
+                'Unable to compute factors p and q from exponent d.')
+
+        rsa.rsa_recover_prime_factors = exhausted
+        try:
+            with self.assertRaises(jwk.RSAMaterialRecoveryError) as ctx:
+                jwk.JWK.from_rsa_private_material(self.minimal)
+            self.assertEqual(ctx.exception.stage, 'recovery')
+        finally:
+            rsa.rsa_recover_prime_factors = original
+
+    def test_length_and_budget_limits_rejected_at_bounds_stage(self):
+        with self.assertRaises(jwk.RSAMaterialBoundsError) as ctx:
+            jwk.JWK.from_rsa_private_material(
+                self.minimal, max_modulus_bits=1024)
+        self.assertEqual(ctx.exception.stage, 'bounds')
+
+        with self.assertRaises(jwk.RSAMaterialBoundsError) as ctx:
+            jwk.JWK.from_rsa_private_material(self.minimal, deadline=0)
+        self.assertEqual(ctx.exception.stage, 'bounds')
+
+        tiny = {'kty': 'RSA',
+                'n': self._b64_int(77),
+                'e': self._b64_int(13),
+                'd': self._b64_int(37)}
+        with self.assertRaises(jwk.RSAMaterialBoundsError) as ctx:
+            jwk.JWK.from_rsa_private_material(tiny)
+        self.assertEqual(ctx.exception.stage, 'bounds')
+
+    def test_failed_import_is_atomic_and_keeps_cache_clean(self):
+        existing = jwk.JWK.from_pyca(self.pyca_key)
+        existing.get_op_key('sign')
+        self.assertIsNotNone(existing._cache_pri_k)
+        snapshot = dict(existing)
+
+        bad = dict(self.minimal)
+        bad['d'] = self._b64_int(self._int(bad['d']) ^ 1)
+        with self.assertRaises(jwk.RSAKeyMaterialError):
+            existing.import_rsa_private_material(bad)
+
+        self.assertEqual(dict(existing), snapshot)
+        self.assertIsNotNone(existing._cache_pri_k)
+        existing.get_op_key('sign')
+
+        fresh = jwk.JWK()
+        with self.assertRaises(jwk.RSAKeyMaterialError):
+            fresh.import_rsa_private_material(bad)
+        self.assertNotIn('n', fresh)
+        self.assertIsNone(fresh._cache_pri_k)
+        self.assertIsNone(fresh._cache_pub_k)
+
+    def test_validation_stage_rejects_pseudoprime_factors(self):
+        # The validation seam rejects composite "prime" factors even when
+        # the (n, e, d) consistency relation itself holds.
+        p, q, lam = self._pseudoprime_factors()
+        e = 65537
+        d = pow(e, -1, lam)
+        n = p * q
+        self.assertEqual(pow(17, e * d, n), 17)
+        self.assertGreaterEqual(n.bit_length(),
+                                jwk.RSA_MIN_MODULUS_BITS)
+        with self.assertRaises(jwk.RSAKeyValidationError) as ctx:
+            jwk.JWK._validate_rsa_private_key(
+                n, e, d, p, q,
+                d % (p - 1), d % (q - 1), pow(q, -1, p))
+        self.assertEqual(ctx.exception.stage, 'validation')
+
+    def test_json_string_and_keyword_arguments(self):
+        key = jwk.JWK.from_rsa_private_material(
+            json_encode(self.minimal), kid='recovered', use='sig')
+        self.assertEqual(key['kid'], 'recovered')
+        self.assertEqual(key['use'], 'sig')
+        self.assertEqual(key.thumbprint(),
+                         jwk.JWK(**self.full).thumbprint())
+
+
 class TestJWS(unittest.TestCase):
     def check_sign(self, test):
         s = jws.JWSCore(test['alg'],
