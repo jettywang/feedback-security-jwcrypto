@@ -394,6 +394,15 @@ class JWS:
             if b64n is not None:
                 if not isinstance(b64n, bool):
                     raise InvalidJWSObject('b64 header must be boolean')
+        # An absent "b64" header is semantically equivalent to the default
+        # value of 'true' (RFC 7797), so normalize it before comparing.
+        # Keeping it as None made the result depend on the order in which
+        # the signatures of a general JWS were processed: an explicit
+        # 'true' following (or preceding) an absent header was wrongly seen
+        # as a conflict, and an explicit 'false' versus an absent header was
+        # accepted in one order and rejected in the other.
+        if b64n is None:
+            b64n = True
         b64 = o.get('b64')
         if b64 == b64n:
             return

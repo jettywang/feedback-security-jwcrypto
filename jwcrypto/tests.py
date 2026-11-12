@@ -3,6 +3,8 @@
 from __future__ import unicode_literals
 
 import copy
+import hashlib
+import hmac
 import unittest
 
 from cryptography.hazmat.backends import default_backend
@@ -2756,6 +2758,96 @@ class TestUnencodedPayload(unittest.TestCase):
         with self.assertRaises(jws.InvalidJWSObject):
             s.add_signature(jwk.JWK(**SymmetricKeys['keys'][1]),
                             protected=rfc7797_u_header)
+
+
+class TestGeneralJWSB64Ordering(unittest.TestCase):
+    """General (multi-signature) JWS must interpret the payload the same way
+    regardless of the order in which signatures are listed.
+
+    An absent "b64" header means the default 'true' (RFC 7797). These tests
+    build real HS256 signatures and recompute each MAC over the exact signing
+    input bytes, so acceptance is never inferred from printed strings.
+    """
+
+    payload = b'$.02 important message'
+
+    def setUp(self):
+        self.key = jwk.JWK.generate(kty='oct', size=256)
+        self.key_bytes = base64url_decode(self.key.get_op_key('verify'))
+
+    def _protected(self, kind):
+        if kind == 'absent':
+            return {'alg': 'HS256'}
+        if kind == 'true':
+            return {'alg': 'HS256', 'b64': True, 'crit': ['b64']}
+        return {'alg': 'HS256', 'b64': False, 'crit': ['b64']}
+
+    def _sign(self, kind):
+        protected = json_encode(self._protected(kind))
+        protected_b64 = base64url_encode(protected)
+        if kind == 'false':
+            carried = self.payload.decode('utf-8')
+            signing_input = protected_b64.encode('ascii') + b'.' \
+                + self.payload
+        else:
+            carried = base64url_encode(self.payload)
+            signing_input = (protected_b64 + '.' + carried).encode('ascii')
+        mac = hmac.new(self.key_bytes, signing_input,
+                       hashlib.sha256).digest()
+        return {'protected': protected_b64,
+                'carried': carried,
+                'signature': base64url_encode(mac),
+                'mac': mac,
+                'signing_input': signing_input}
+
+    def _token(self, kinds, raw_payload=False):
+        entries = [self._sign(k) for k in kinds]
+        for entry in entries:
+            # Independent byte-level check of every carried signature.
+            expected = hmac.new(self.key_bytes, entry['signing_input'],
+                                hashlib.sha256).digest()
+            self.assertTrue(
+                hmac.compare_digest(expected, entry['mac']))
+        payload = (self.payload.decode('utf-8') if raw_payload
+                   else entries[0]['carried'])
+        token = {'payload': payload, 'signatures': [
+            {'protected': e['protected'], 'signature': e['signature']}
+            for e in entries]}
+        return json_encode(token), entries
+
+    def _assert_each_signature_verifies(self, token):
+        obj = jws.JWS()
+        obj.deserialize(token)
+        self.assertEqual(obj.objects['payload'], self.payload)
+        for entry in obj.objects['signatures']:
+            obj.verifylog = []
+            obj._verify(None, self.key, obj.objects['payload'],
+                        entry['signature'], entry.get('protected'),
+                        entry.get('header'))
+
+    def test_absent_and_explicit_true_are_equivalent(self):
+        # Both orderings must deserialize to the same payload and verify;
+        # the absent header is the default 'true', so this is not a conflict.
+        for order in (('absent', 'true'), ('true', 'absent')):
+            token, _ = self._token(list(order))
+            self._assert_each_signature_verifies(token)
+
+    def test_genuine_b64_conflict_rejected_in_either_order(self):
+        for order in (('false', 'absent'), ('absent', 'false')):
+            token, _ = self._token(list(order), raw_payload=True)
+            with self.assertRaises(jws.InvalidJWSObject):
+                jws.JWS().deserialize(token)
+
+    def test_non_boolean_b64_rejected(self):
+        protected = base64url_encode(
+            json_encode({'alg': 'HS256', 'b64': 'true'}))
+        token = json_encode({
+            'payload': base64url_encode(self.payload),
+            'signatures': [
+                {'protected': protected,
+                 'signature': base64url_encode(b'\x00' * 32)}]})
+        with self.assertRaises(jws.InvalidJWSObject):
+            jws.JWS().deserialize(token)
 
 
 class TestOverloadedOperators(unittest.TestCase):
