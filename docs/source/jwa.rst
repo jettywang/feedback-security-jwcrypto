@@ -29,5 +29,11 @@ Module Settings
 .. autodata:: jwcrypto.jwa.default_max_pbkdf2_iterations
    :annotation:
 
+.. autodata:: jwcrypto.jwa.default_pbes2_decrypt_budget
+   :annotation:
+
+.. autoclass:: jwcrypto.jwa.PBES2WorkBudget
+   :members:
+
 .. autodata:: jwcrypto.jwa.default_enforce_hmac_key_length
    :annotation:

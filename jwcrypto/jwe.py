@@ -3,9 +3,13 @@
 import zlib
 
 from jwcrypto import common
+from jwcrypto import jwa
 from jwcrypto.common import InvalidJWSEHeader
 from jwcrypto.common import JWKeyNotFound
 from jwcrypto.common import JWSEHeaderParameter, JWSEHeaderRegistry
+from jwcrypto.common import InvalidJWEData
+from jwcrypto.common import InvalidJWEPBES2Parameters
+from jwcrypto.common import JWEPBES2BudgetExceeded
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import check_crit, merge_headers, validate_headers
 from jwcrypto.common import json_decode, json_encode
@@ -57,9 +61,11 @@ default_allowed_algs = [
 # These have been moved to jwcrypto.common, maintain here for backwards compat
 InvalidCEKeyLength = common.InvalidCEKeyLength
 InvalidJWEData = common.InvalidJWEData
+InvalidJWEPBES2Parameters = common.InvalidJWEPBES2Parameters
 InvalidJWEKeyLength = common.InvalidJWEKeyLength
 InvalidJWEKeyType = common.InvalidJWEKeyType
 InvalidJWEOperation = common.InvalidJWEOperation
+JWEPBES2BudgetExceeded = common.JWEPBES2BudgetExceeded
 
 
 class JWE:
@@ -97,6 +103,7 @@ class JWE:
                 self.plaintext = plaintext.encode('utf-8')
         self.cek = None
         self.decryptlog = None
+        self.pbes2_iterations_spent = 0
         if aad:
             self.objects['aad'] = aad
         if protected:
@@ -349,15 +356,17 @@ class JWE:
             return json_encode(enc)
 
     def _unwrap_decrypt(self, alg, enc, key, enckey, header,
-                        aad, iv, ciphertext, tag):
-        cek = alg.unwrap(key, enc.wrap_key_size, enckey, header)
+                        aad, iv, ciphertext, tag, budget=None):
+        cek = alg.unwrap(key, enc.wrap_key_size, enckey, header,
+                         budget=budget)
         data = enc.decrypt(cek, aad, iv, ciphertext, tag)
         self.decryptlog.append('Success')
         self.cek = cek
         return data
 
     # FIXME: allow to specify which algorithms to accept as valid
-    def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size):
+    def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size,
+                 budget=None):
 
         jh = self._get_jose_header(ppe.get('header', None))
 
@@ -390,9 +399,15 @@ class JWE:
                                                 ppe.get('encrypted_key', b''),
                                                 jh, aad, self.objects['iv'],
                                                 self.objects['ciphertext'],
-                                                self.objects['tag'])
+                                                self.objects['tag'],
+                                                budget=budget)
                     self.decryptlog.append("Success")
                     break
+                except (JWEPBES2BudgetExceeded,
+                        InvalidJWEPBES2Parameters):
+                    # Malformed parameters and an exhausted budget are
+                    # properties of the token/call, not of this candidate.
+                    raise
                 except Exception as e:  # pylint: disable=broad-except
                     keyid = k.get('kid', k.thumbprint())
                     self.decryptlog.append('Key [{}] failed: [{}]'.format(
@@ -405,7 +420,8 @@ class JWE:
                                         ppe.get('encrypted_key', b''),
                                         jh, aad, self.objects['iv'],
                                         self.objects['ciphertext'],
-                                        self.objects['tag'])
+                                        self.objects['tag'],
+                                        budget=budget)
 
         compress = jh.get('zip', None)
         if compress == 'DEF':
@@ -425,7 +441,8 @@ class JWE:
         else:
             raise ValueError('Unknown compression')
 
-    def decrypt(self, key, max_plaintext=0):
+    def decrypt(self, key, max_plaintext=0, max_pbes2_iterations=None,
+                pbes2_budget=None):
         """Decrypt a JWE token.
 
         :param key: The (:class:`jwcrypto.jwk.JWK`) decryption key.
@@ -436,50 +453,107 @@ class JWE:
          the library default applies. Application writers are recommended
          to set a limit here if they know what is the max plaintext size
          for their application.
+        :param max_pbes2_iterations: Maximum total PBKDF2 iterations that
+         all PBES2 key derivations in this call may perform.  The budget
+         covers every recipient and every JWKSet candidate key attempted
+         in the call, is checked before each derivation runs, and is
+         created fresh for every call (retrying the same object never
+         inherits credit from an earlier attempt).  ``None`` uses
+         :data:`jwcrypto.jwa.default_pbes2_decrypt_budget`.
+        :param pbes2_budget: Alias for `max_pbes2_iterations`; may also be
+         a :class:`jwcrypto.jwa.PBES2WorkBudget` instance.  An instance
+         passed by the caller is reset at the start of the call so that a
+         retry cannot reuse leftover credit.
 
         :raises InvalidJWEOperation: if the key is not a JWK object.
         :raises InvalidJWEData: if the ciphertext can't be decrypted or
          the object is otherwise malformed.
+        :raises InvalidJWEPBES2Parameters: if PBES2 header parameters are
+         malformed.
+        :raises JWEPBES2BudgetExceeded: if the call's PBES2 budget would
+         be exceeded.
         :raises JWKeyNotFound: if key is a JWKSet and the key is not found.
         """
 
         self.plaintext = None
+        self.cek = None
+        self.pbes2_iterations_spent = 0
         if max_plaintext == 0:
             max_plaintext = default_max_plaintext_size
+
+        if max_pbes2_iterations is not None and pbes2_budget is not None:
+            raise ValueError('Specify only one PBES2 budget')
+
+        if isinstance(pbes2_budget, jwa.PBES2WorkBudget):
+            budget = pbes2_budget
+            budget.spent = 0
+        else:
+            limit = max_pbes2_iterations
+            if pbes2_budget is not None:
+                limit = pbes2_budget
+            if limit is None:
+                limit = jwa.default_pbes2_decrypt_budget
+            budget = jwa.PBES2WorkBudget(limit)
 
         if 'ciphertext' not in self.objects:
             raise InvalidJWEOperation("No available ciphertext")
         self.decryptlog = []
         missingkey = False
+        malformed = None
 
-        if 'recipients' in self.objects:
-            if len(self.objects['recipients']) > default_max_recipients:
-                raise InvalidJWEData(
-                    'Too many recipients (%d)' %
-                    len(self.objects['recipients']))
-            for rec in self.objects['recipients']:
+        try:
+            if 'recipients' in self.objects:
+                if len(self.objects['recipients']) > default_max_recipients:
+                    raise InvalidJWEData(
+                        'Too many recipients (%d)' %
+                        len(self.objects['recipients']))
+                for rec in self.objects['recipients']:
+                    try:
+                        self._decrypt(key, rec, max_plaintext=max_plaintext,
+                                      budget=budget)
+                        # Stop after the first successful recipient.
+                        if self.plaintext is not None:
+                            break
+                    except JWEPBES2BudgetExceeded:
+                        # No further PBES2 derivation can fit this call.
+                        raise
+                    except InvalidJWEPBES2Parameters as e:
+                        if malformed is None:
+                            malformed = e
+                        self.decryptlog.append('Failed: [%s]' % repr(e))
+                    except Exception as e:  # pylint: disable=broad-except
+                        if isinstance(e, JWKeyNotFound):
+                            missingkey = True
+                        self.decryptlog.append('Failed: [%s]' % repr(e))
+            else:
                 try:
-                    self._decrypt(key, rec, max_plaintext=max_plaintext)
-                    # Stop after the first successful recipient.
-                    if self.plaintext is not None:
-                        break
+                    self._decrypt(key, self.objects,
+                                  max_plaintext=max_plaintext, budget=budget)
+                except JWEPBES2BudgetExceeded:
+                    raise
+                except InvalidJWEPBES2Parameters as e:
+                    malformed = e
+                    self.decryptlog.append('Failed: [%s]' % repr(e))
                 except Exception as e:  # pylint: disable=broad-except
                     if isinstance(e, JWKeyNotFound):
                         missingkey = True
                     self.decryptlog.append('Failed: [%s]' % repr(e))
-        else:
-            try:
-                self._decrypt(key, self.objects, max_plaintext=max_plaintext)
-            except Exception as e:  # pylint: disable=broad-except
-                if isinstance(e, JWKeyNotFound):
-                    missingkey = True
-                self.decryptlog.append('Failed: [%s]' % repr(e))
 
-        if not self.plaintext:
-            if missingkey:
-                raise JWKeyNotFound("Key Not found in JWKSet")
-            raise InvalidJWEData('No recipient matched the provided '
-                                 'key' + repr(self.decryptlog))
+            if not self.plaintext:
+                if malformed is not None:
+                    raise malformed
+                if missingkey:
+                    raise JWKeyNotFound("Key Not found in JWKSet")
+                raise InvalidJWEData('No recipient matched the provided '
+                                     'key' + repr(self.decryptlog))
+        except Exception:
+            # A failed call must never leave plaintext from this or an
+            # earlier successful decrypt() reachable through payload.
+            self.plaintext = None
+            self.cek = None
+            raise
+        finally:
+            self.pbes2_iterations_spent = budget.spent
 
     def deserialize(self, raw_jwe, key=None):
         """Deserialize a JWE token.
@@ -504,6 +578,7 @@ class JWE:
         self.objects = {}
         self.plaintext = None
         self.cek = None
+        self.pbes2_iterations_spent = 0
 
         o = {}
         try:

@@ -3,6 +3,7 @@
 from __future__ import unicode_literals
 
 import copy
+import hashlib
 import unittest
 
 from cryptography.hazmat.backends import default_backend
@@ -1818,6 +1819,275 @@ class TestJWE(unittest.TestCase):
         b.deserialize(token)
         b.decrypt(key_pbes)
         self.assertEqual(b.payload, payload)
+
+    def test_pbes2_call_budget_counts_every_recipient(self):
+        """All PBES2 derivations in one decrypt call share one limit."""
+        password = jwk.JWK.from_password('budget-pass')
+        wrong = jwk.JWK.from_password('wrong-pass')
+        payload = b'budgeted'
+        iterations = 1024
+
+        def build(count, plaintext=payload):
+            enc = jwe.JWE(plaintext=plaintext,
+                          protected={'enc': 'A256GCM'},
+                          flattened=False)
+            for _ in range(count):
+                enc.add_recipient(password, header={
+                    'alg': 'PBES2-HS256+A128KW',
+                    'p2c': iterations,
+                    'p2s': base64url_encode(b'b' * 16)})
+            return enc.serialize()
+
+        # Replace the real PBKDF2 derivation with a countable stand-in so
+        # no expensive work runs and every attempt is observable.
+        derivations = []
+
+        class CountingKDF:
+            def __init__(self, algorithm, length, salt, iterations,
+                         backend=None):
+                derivations.append(iterations)
+                self.length = length
+                self.salt = salt
+
+            def derive(self, key_material):
+                digest = hashlib.sha256(key_material + self.salt).digest()
+                return digest[:self.length]
+
+        original_kdf = jwa.PBKDF2HMAC
+        self.addCleanup(setattr, jwa, 'PBKDF2HMAC', original_kdf)
+        jwa.PBKDF2HMAC = CountingKDF
+
+        # A wrong password makes every recipient derive and fail.  Two
+        # individually legal recipients (1024 each) fit an explicit 2048
+        # budget; each attempt is charged and counted.
+        token2 = build(2)
+        derivations[:] = []
+        check = jwe.JWE()
+        check.deserialize(token2)
+        with self.assertRaises(jwe.InvalidJWEData) as ctx:
+            check.decrypt(wrong, max_pbes2_iterations=2 * iterations)
+        self.assertNotIsInstance(ctx.exception, jwe.JWEPBES2BudgetExceeded)
+        self.assertEqual(derivations, [iterations, iterations])
+        self.assertEqual(check.pbes2_iterations_spent, 2 * iterations)
+
+        # Three recipients at 1024 each exceed the 2048 call budget on the
+        # third attempt; the third derivation must never run.
+        token3 = build(3)
+        derivations[:] = []
+        check3 = jwe.JWE()
+        check3.deserialize(token3)
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded):
+            check3.decrypt(wrong, max_pbes2_iterations=2 * iterations)
+        self.assertEqual(derivations, [iterations, iterations])
+        self.assertEqual(check3.pbes2_iterations_spent, 2 * iterations)
+        self.assertIsNone(check3.plaintext)
+
+    def test_pbes2_budget_retry_starts_fresh(self):
+        """A retry never inherits credit from an earlier call."""
+        password = jwk.JWK.from_password('retry-pass')
+        wrong = jwk.JWK.from_password('retry-wrong')
+        payload = b'retry'
+        iterations = 1024
+        enc = jwe.JWE(plaintext=payload,
+                      protected={'enc': 'A256GCM'},
+                      flattened=False)
+        for _ in range(2):
+            enc.add_recipient(password, header={
+                'alg': 'PBES2-HS256+A128KW',
+                'p2c': iterations,
+                'p2s': base64url_encode(b'r' * 16)})
+        token = enc.serialize()
+
+        check = jwe.JWE()
+        check.deserialize(token)
+        # First call spends the whole 2*iterations budget and fails.
+        with self.assertRaises(jwe.InvalidJWEData):
+            check.decrypt(wrong, max_pbes2_iterations=2 * iterations)
+        self.assertEqual(check.pbes2_iterations_spent, 2 * iterations)
+
+        # The next call must start at zero, not with the previous credit.
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded):
+            check.decrypt(wrong, max_pbes2_iterations=iterations)
+        self.assertEqual(check.pbes2_iterations_spent, iterations)
+
+        # A caller-supplied budget object is also reset per call.
+        supplied = jwa.PBES2WorkBudget(iterations)
+        supplied.spent = 500
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded):
+            check.decrypt(wrong, pbes2_budget=supplied)
+        self.assertEqual(supplied.spent, iterations)
+
+    def test_pbes2_param_errors_are_not_budget_or_password_errors(self):
+        """Malformed parameters, exhausted budget and wrong password differ."""
+        password = jwk.JWK.from_password('distinguish')
+        payload = b'distinguish'
+
+        def token_with(hdr):
+            return json_encode({
+                'protected': base64url_encode(json_encode(hdr)),
+                'iv': base64url_encode(b'0' * 12),
+                'ciphertext': base64url_encode(b'x' * 16),
+                'tag': base64url_encode(b'0' * 16),
+            })
+
+        cases = [
+            {'alg': 'PBES2-HS256+A128KW', 'enc': 'A256GCM',
+             'p2c': 1024},
+            {'alg': 'PBES2-HS256+A128KW', 'enc': 'A256GCM',
+             'p2c': 1024, 'p2s': base64url_encode(b'short')},
+            {'alg': 'PBES2-HS256+A128KW', 'enc': 'A256GCM',
+             'p2s': base64url_encode(b'p' * 16)},
+            {'alg': 'PBES2-HS256+A128KW', 'enc': 'A256GCM',
+             'p2c': '1024', 'p2s': base64url_encode(b'p' * 16)},
+            {'alg': 'PBES2-HS256+A128KW', 'enc': 'A256GCM',
+             'p2c': 0, 'p2s': base64url_encode(b'p' * 16)},
+        ]
+        for hdr in cases:
+            check = jwe.JWE()
+            check.deserialize(token_with(hdr))
+            with self.assertRaises(jwe.InvalidJWEPBES2Parameters):
+                check.decrypt(password)
+
+        # A well-formed token with the wrong password is a decrypt
+        # failure, never a parameter or budget error.
+        enc = jwe.JWE(plaintext=payload,
+                      protected={'alg': 'PBES2-HS256+A128KW',
+                                 'enc': 'A256GCM',
+                                 'p2c': 1024,
+                                 'p2s': base64url_encode(b'p' * 16)})
+        enc.add_recipient(password)
+        check = jwe.JWE()
+        check.deserialize(enc.serialize())
+        with self.assertRaises(jwe.InvalidJWEData) as ctx:
+            check.decrypt(jwk.JWK.from_password('nope'))
+        self.assertNotIsInstance(ctx.exception,
+                                 (jwe.InvalidJWEPBES2Parameters,
+                                  jwe.JWEPBES2BudgetExceeded))
+
+        # Exhausting the budget is reported as a budget error.
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded) as ctx2:
+            check.decrypt(password, max_pbes2_iterations=100)
+        self.assertNotIsInstance(ctx2.exception,
+                                 jwe.InvalidJWEPBES2Parameters)
+
+    def test_malformed_recipient_does_not_mask_later_success(self):
+        """A malformed recipient is recorded but a valid one still works."""
+        password = jwk.JWK.from_password('mask-pass')
+        payload = b'not-masked'
+        enc = jwe.JWE(plaintext=payload,
+                      protected={'enc': 'A256GCM'},
+                      flattened=False)
+        header = {'alg': 'PBES2-HS256+A128KW',
+                  'p2c': 1024,
+                  'p2s': base64url_encode(b'q' * 16)}
+        enc.add_recipient(password, header=header)
+        enc.add_recipient(password, header=header)
+
+        # Corrupt the first recipient's salt: it is now malformed, while
+        # the second recipient remains valid for the same password.
+        serialized = json_decode(enc.serialize())
+        serialized['recipients'][0]['header']['p2s'] = \
+            base64url_encode(b'q' * 4)
+        check = jwe.JWE()
+        check.deserialize(json_encode(serialized))
+        check.decrypt(password, max_pbes2_iterations=2 * 1024)
+        self.assertEqual(check.payload, payload)
+        self.assertEqual(check.pbes2_iterations_spent, 1024)
+
+    def test_pbes2_failure_clears_previous_plaintext(self):
+        """A failed decrypt cannot leave an earlier payload readable."""
+        password = jwk.JWK.from_password('clear-pass')
+        wrong = jwk.JWK.from_password('clear-wrong')
+        payload = b'secret-payload'
+        enc = jwe.JWE(plaintext=payload,
+                      protected={'alg': 'PBES2-HS256+A128KW',
+                                 'enc': 'A256GCM',
+                                 'p2c': 1024,
+                                 'p2s': base64url_encode(b'z' * 16)})
+        enc.add_recipient(password)
+        token = enc.serialize()
+
+        check = jwe.JWE()
+        check.deserialize(token)
+        check.decrypt(password)
+        self.assertEqual(check.payload, payload)
+
+        with self.assertRaises(jwe.InvalidJWEData):
+            check.decrypt(wrong)
+        self.assertIsNone(check.plaintext)
+        self.assertIsNone(check.cek)
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            check.payload
+
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded):
+            check.decrypt(password, max_pbes2_iterations=100)
+        self.assertIsNone(check.plaintext)
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            check.payload
+
+    def test_pbes2_call_budget_success_after_failures(self):
+        """A legitimate low-cost token still decrypts with a modest budget."""
+        password = jwk.JWK.from_password('right-pass')
+        wrong = jwk.JWK.from_password('wrong-pass')
+        payload = b'still-works'
+        iterations = 512
+        enc = jwe.JWE(plaintext=payload,
+                      protected={'enc': 'A256GCM'},
+                      flattened=False)
+        header = {'alg': 'PBES2-HS512+A256KW',
+                  'p2c': iterations,
+                  'p2s': base64url_encode(b'c' * 16)}
+        enc.add_recipient(password, header=header)
+        enc.add_recipient(password, header=header)
+        token = enc.serialize()
+
+        check = jwe.JWE()
+        check.deserialize(token)
+        check.decrypt(password, max_pbes2_iterations=2 * iterations)
+        self.assertEqual(check.payload, payload)
+        self.assertEqual(check.pbes2_iterations_spent, iterations)
+
+    def test_pbes2_budget_key_set_candidates_share_limit(self):
+        """A JWKSet offers several candidate keys to one decrypt call."""
+        iterations = 1024
+        password = jwk.JWK.from_password('right-pass')
+        payload = b'keyset-budget'
+        enc = jwe.JWE(plaintext=payload,
+                      protected={'alg': 'PBES2-HS256+A128KW',
+                                 'enc': 'A256GCM',
+                                 'p2c': iterations,
+                                 'p2s': base64url_encode(b'k' * 16)})
+        enc.add_recipient(password)
+        token = enc.serialize()
+
+        ks = jwk.JWKSet()
+        for i in range(3):
+            key = jwk.JWK.from_password('candidate-%d' % i)
+            key['kid'] = 'candidate-%d' % i
+            ks.add(key)
+
+        check = jwe.JWE()
+        check.deserialize(token)
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded):
+            check.decrypt(ks, max_pbes2_iterations=2 * iterations)
+        self.assertEqual(check.pbes2_iterations_spent, 2 * iterations)
+        self.assertIsNone(check.plaintext)
+
+        # The same set with a budget large enough derives for every
+        # candidate and reports the accumulated work.
+        with self.assertRaises(JWKeyNotFound):
+            check.decrypt(ks, max_pbes2_iterations=3 * iterations)
+        self.assertEqual(check.pbes2_iterations_spent, 3 * iterations)
+
+        # No stale plaintext from an earlier successful decrypt survives.
+        good = jwe.JWE()
+        good.deserialize(token)
+        good.decrypt(password)
+        self.assertEqual(good.payload, payload)
+        with self.assertRaises(jwe.JWEPBES2BudgetExceeded):
+            good.decrypt(ks, max_pbes2_iterations=2 * iterations)
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            good.payload
 
     def test_jwe_zip_in_unprotected_header(self):
         payload = b'test-zip'

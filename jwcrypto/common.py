@@ -84,6 +84,42 @@ class InvalidJWEData(JWException):
         super(InvalidJWEData, self).__init__(msg)
 
 
+class InvalidJWEPBES2Parameters(InvalidJWEData, ValueError):
+    """Invalid PBES2 parameters.
+
+    This exception is raised when PBES2 key derivation parameters are
+    missing or malformed.  It is also a ValueError for compatibility with
+    the validation performed while encrypting.
+    """
+
+    def __init__(self, message=None, exception=None):
+        InvalidJWEData.__init__(self, message, exception)
+
+
+class JWEPBES2BudgetExceeded(InvalidJWEData):
+    """The PBES2 work budget for one decrypt call was exceeded.
+
+    This exception is raised when the sum of the PBKDF2 iteration counts
+    needed by all attempts in a single decrypt call would exceed the
+    call-level budget.  It is distinct from malformed parameters and from
+    a password that simply does not match.
+    """
+
+    def __init__(self, message=None, limit=None, spent=None, requested=None):
+        if message is None:
+            message = 'PBES2 work budget exceeded'
+            if limit is not None:
+                message += ' (limit %s' % limit
+                if spent is not None and requested is not None:
+                    message += ', spent %s, requested %s' % (
+                        spent, requested)
+                message += ')'
+            elif spent is not None and requested is not None:
+                message += ' (spent %s, requested %s)' % (
+                    spent, requested)
+        super().__init__(message)
+
+
 class InvalidJWSEHeader(JWException):
     """Invalid JWSE Header.
 

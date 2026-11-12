@@ -19,11 +19,13 @@ from cryptography.hazmat.primitives.keywrap import aes_key_unwrap, aes_key_wrap
 from cryptography.hazmat.primitives.padding import PKCS7
 
 from jwcrypto.common import InvalidCEKeyLength
+from jwcrypto.common import InvalidJWEPBES2Parameters
 from jwcrypto.common import InvalidJWAAlgorithm
 from jwcrypto.common import InvalidJWEData
 from jwcrypto.common import InvalidJWEKeyLength
 from jwcrypto.common import InvalidJWEKeyType
 from jwcrypto.common import InvalidJWEOperation
+from jwcrypto.common import JWEPBES2BudgetExceeded
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import json_decode
 from jwcrypto.jwk import JWK
@@ -52,6 +54,95 @@ default_max_pbkdf2_iterations = 16384
 This is a security measure to prevent denial-of-service attacks by malicious
 actors providing a very high iteration count.
 """
+
+default_pbes2_decrypt_budget = 10 * default_max_pbkdf2_iterations
+"""The maximum total PBKDF2 iterations allowed for one decrypt call.
+
+The per-parameter limit above bounds a single derivation.  A JWE may carry
+several recipients, and a JWKSet may offer several candidate keys, so the
+same call can trigger many derivations.  This budget is the sum of the
+iteration counts charged by every attempt made during a single
+:meth:`jwcrypto.jwe.JWE.decrypt` call.  Each attempt is charged before the
+derivation runs, and every call starts with a fresh budget, so retrying the
+same object never inherits unused credit from an earlier call.
+
+The default equals the per-parameter limit multiplied by the default
+recipient limit used by :mod:`jwcrypto.jwe`, so a token that passes the
+existing per-item and per-recipient checks is not rejected merely for
+using PBES2.  Callers that accept large JWK sets can pass a smaller or
+larger budget explicitly.
+"""
+
+
+class PBES2WorkBudget:
+    """Call-scoped accounting for PBES2 key derivation work.
+
+    A budget instance lives for exactly one decrypt call.  The iteration
+    count of an attempt is reserved before the derivation starts; if the
+    reservation would exceed the limit the attempt is rejected without
+    running PBKDF2.
+    """
+
+    def __init__(self, limit=None):
+        if limit is None:
+            limit = default_pbes2_decrypt_budget
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise ValueError('Invalid PBES2 budget limit')
+        self.limit = limit
+        self.spent = 0
+
+    @property
+    def remaining(self):
+        return self.limit - self.spent
+
+    def charge(self, iterations):
+        """Reserve iterations before an expensive derivation.
+
+        :raises JWEPBES2BudgetExceeded: if the reservation does not fit.
+        """
+        if iterations > self.remaining:
+            raise JWEPBES2BudgetExceeded(
+                limit=self.limit, spent=self.spent, requested=iterations)
+        self.spent += iterations
+
+
+def _validate_pbes2_params(headers):
+    """Validate and decode the PBES2 parameters without deriving a key.
+
+    Errors found here indicate malformed input, not a password mismatch,
+    and are raised before any budget is charged or PBKDF2 work performed.
+    """
+
+    if 'p2s' not in headers:
+        raise InvalidJWEPBES2Parameters(
+            'Invalid Header, missing "p2s" parameter')
+
+    p2s = headers['p2s']
+    if not isinstance(p2s, str):
+        raise InvalidJWEPBES2Parameters(
+            'Invalid Header, "p2s" parameter must be a string')
+    try:
+        p2s = base64url_decode(p2s)
+    except ValueError as e:
+        raise InvalidJWEPBES2Parameters(
+            'Invalid Header, malformed "p2s" parameter') from e
+    if len(p2s) < 8:
+        raise InvalidJWEPBES2Parameters(
+            'Invalid Salt, must be 8 or more octects')
+
+    if 'p2c' not in headers:
+        raise InvalidJWEPBES2Parameters(
+            'Invalid Header, missing "p2c" parameter')
+
+    p2c = headers['p2c']
+    if not isinstance(p2c, int) or isinstance(p2c, bool) or p2c < 1:
+        raise InvalidJWEPBES2Parameters(
+            'Invalid Header, "p2c" parameter must be a positive integer')
+    if p2c > default_max_pbkdf2_iterations:
+        raise InvalidJWEPBES2Parameters(
+            'Invalid p2c value, too large')
+
+    return p2s, p2c
 
 default_warn_deprecated_algorithms = False
 """When True, emit a DeprecationWarning when instantiating an algorithm
@@ -399,7 +490,7 @@ class _RawKeyMgmt:
     def wrap(self, key, bitsize, cek, headers):
         raise NotImplementedError
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         raise NotImplementedError
 
 
@@ -423,7 +514,7 @@ class _RSA(_RawKeyMgmt):
         ek = rk.encrypt(cek, self.padfn)
         return {'cek': cek, 'ek': ek}
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         self._check_key(key)
         rk = key.get_op_key('unwrapKey')
         cek = rk.decrypt(ek, self.padfn)
@@ -443,7 +534,7 @@ class _Rsa15(_RSA, JWAAlgorithm):
     def __init__(self):
         super(_Rsa15, self).__init__(padding.PKCS1v15())
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         self._check_key(key)
         # Address MMA attack by implementing RFC 3218 - 2.3.2. Random Filling
         # provides a random cek that will cause the decryption engine to
@@ -515,7 +606,7 @@ class _AesKw(_RawKeyMgmt):
 
         return {'cek': cek, 'ek': ek}
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         rk = self._get_key(key, 'decrypt')
 
         cek = aes_key_unwrap(rk, ek, default_backend())
@@ -584,7 +675,7 @@ class _AesGcmKw(_RawKeyMgmt):
                 'header': {'iv': base64url_encode(iv),
                            'tag': base64url_encode(tag)}}
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         rk = self._get_key(key, 'decrypt')
 
         if 'iv' not in headers:
@@ -693,13 +784,12 @@ class _Pbes2HsAesKw(_RawKeyMgmt):
             ret['header'] = ret_header
         return ret
 
-    def unwrap(self, key, bitsize, ek, headers):
-        if 'p2s' not in headers:
-            raise ValueError('Invalid Header, missing "p2s" parameter')
-        if 'p2c' not in headers:
-            raise ValueError('Invalid Header, missing "p2c" parameter')
-        p2s = base64url_decode(headers['p2s'])
-        p2c = headers['p2c']
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
+        p2s, p2c = _validate_pbes2_params(headers)
+        # Reserve the iteration work before the expensive derivation runs.
+        # A rejected reservation leaves no PBKDF2 work done.
+        if budget is not None:
+            budget.charge(p2c)
         kek = self._get_key(headers['alg'], key, p2s, p2c)
 
         aeskw = self.aeskwmap[self.keysize]()
@@ -759,7 +849,7 @@ class _Direct(_RawKeyMgmt, JWAAlgorithm):
             raise InvalidCEKeyLength(bitsize, _bitsize(k))
         return {'cek': k}
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         self._check_key(key)
         if ek != b'':
             raise ValueError('Invalid Encryption Key.')
@@ -853,7 +943,7 @@ class _EcdhEs(_RawKeyMgmt, JWAAlgorithm):
         ret['header'] = {'epk': json_decode(epk.export_public())}
         return ret
 
-    def unwrap(self, key, bitsize, ek, headers):
+    def unwrap(self, key, bitsize, ek, headers, budget=None):
         if 'epk' not in headers:
             raise ValueError('Invalid Header, missing "epk" parameter')
         if len(ek) > 0 and not self.allow_ek:

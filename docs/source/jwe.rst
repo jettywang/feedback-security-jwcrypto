@@ -19,6 +19,9 @@ Variables
 
 .. autodata:: jwcrypto.jwe.default_allowed_algs
 
+.. autodata:: jwcrypto.jwa.default_pbes2_decrypt_budget
+   :annotation:
+
 Exceptions
 ----------
 
@@ -27,6 +30,14 @@ Exceptions
    :show-inheritance:
 
 .. autoclass:: jwcrypto.jwe.InvalidJWEData
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwe.InvalidJWEPBES2Parameters
+   :members:
+   :show-inheritance:
+
+.. autoclass:: jwcrypto.jwe.JWEPBES2BudgetExceeded
    :members:
    :show-inheritance:
 
@@ -96,3 +107,28 @@ Decrypt a JWE token::
     >>> jwetoken = jwe.JWE()
     >>> jwetoken.deserialize(enc, key=private_key)
     >>> payload = jwetoken.payload
+
+PBES2 call budget
+~~~~~~~~~~~~~~~~~
+
+PBES2 key derivation is intentionally expensive.  A single JWE may carry
+several recipients and a JWKSet may offer many candidate keys, so the
+number of derivations is not bounded by the per-token ``p2c`` parameter
+alone.  :meth:`jwcrypto.jwe.JWE.decrypt` accepts a call-level budget that
+is shared by every attempt in that call and checked before each
+derivation::
+
+    from jwcrypto import jwk
+    password = jwk.JWK.from_password('a password')
+    jwetoken = jwe.JWE()
+    jwetoken.deserialize(enc)
+    jwetoken.decrypt(password, max_pbes2_iterations=300000)
+    jwetoken.payload
+
+The budget defaults to :data:`jwcrypto.jwa.default_pbes2_decrypt_budget`,
+is recreated for every call, and never inherits unused credit from an
+earlier attempt.  Malformed PBES2 parameters raise
+:class:`jwcrypto.jwe.InvalidJWEPBES2Parameters`, an exhausted budget
+raises :class:`jwcrypto.jwe.JWEPBES2BudgetExceeded`, and a well-formed
+token that simply does not match the supplied password keeps raising
+:class:`jwcrypto.jwe.InvalidJWEData`.
