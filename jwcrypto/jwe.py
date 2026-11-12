@@ -413,13 +413,27 @@ class JWE:
                 raise InvalidJWEData(
                     'Compressed data exceeds maximum allowed'
                     'size' + f' ({default_max_compressed_size})')
-            do = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
-            self.plaintext = do.decompress(data, max_plaintext)
-            if do.unconsumed_tail or not do.eof:
+            # Authentication has succeeded at this point, but the DEFLATE
+            # stream still has to be verified to be complete on its own.
+            # Keep any partial output in a local variable so a failed
+            # decompression can never leave partial plaintext on the object.
+            decompressor = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+            try:
+                plaintext = decompressor.decompress(data, max_plaintext)
+            except zlib.error as e:
+                self.plaintext = None
+                raise InvalidJWEData(
+                    'Malformed compressed data: %s' % e) from e
+            if decompressor.unconsumed_tail:
                 self.plaintext = None
                 raise InvalidJWEData(
                     'Compressed data exceeds maximum allowed'
                     'output size' + f' ({max_plaintext})')
+            if not decompressor.eof or decompressor.unused_data:
+                self.plaintext = None
+                raise InvalidJWEData(
+                    'Incomplete or trailing data in compressed stream')
+            self.plaintext = plaintext
         elif compress is None:
             self.plaintext = data
         else:
