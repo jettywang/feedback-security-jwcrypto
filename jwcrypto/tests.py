@@ -810,6 +810,224 @@ class TestJWK(unittest.TestCase):
         s.add_signature(key, None, {"alg": "PS256"})
         s.serialize()
 
+    def test_cache_ignores_metadata_changes(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        pubkey = key.get_op_key('verify')
+        prikey = key.get_op_key('sign')
+
+        # Display identifier only: cache and usability must be preserved.
+        key['kid'] = 'display-name'
+        key.kid = 'another-name'
+        self.assertIs(key.get_op_key('verify'), pubkey)
+        self.assertIs(key.get_op_key('sign'), prikey)
+
+        s = jws.JWS(b'payload')
+        s.add_signature(key, None, {'alg': 'ES256'})
+        token = s.serialize(compact=True)
+        v = jws.JWS()
+        v.deserialize(token, key)
+        self.assertEqual(v.payload, b'payload')
+
+        # use/key_ops are metadata and re-evaluated on every call.
+        key.use = 'sig'
+        key.key_ops = ['sign', 'verify']
+        self.assertIs(key.get_op_key('sign'), prikey)
+        key.use = 'enc'
+        with self.assertRaises(jwk.InvalidJWKUsage):
+            key.get_op_key('sign')
+
+    def test_cache_invalidated_on_material_change(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        pubkey = key.get_op_key('verify')
+        prikey = key.get_op_key('sign')
+        rotated = jwk.JWK.generate(kty='EC', crv='P-256')
+
+        # Real material rotation through __setitem__ and update().
+        key['x'] = rotated['x']
+        key['y'] = rotated['y']
+        self.assertIsNot(key.get_op_key('verify'), pubkey)
+        key.update(d=rotated['d'])
+        self.assertIsNot(key.get_op_key('sign'), prikey)
+        self.assertEqual(
+            key.get_op_key('sign').private_numbers().private_value,
+            rotated.get_op_key('sign').private_numbers().private_value)
+
+        # The same through |=, which bypasses dict.__setitem__.
+        key2 = jwk.JWK.generate(kty='EC', crv='P-256')
+        pubkey2 = key2.get_op_key('verify')
+        other = jwk.JWK.generate(kty='EC', crv='P-256')
+        key2 |= other.export(as_dict=True)
+        self.assertEqual(key2['x'], other['x'])
+        self.assertIsNot(key2.get_op_key('verify'), pubkey2)
+        self.assertEqual(key2.get_op_key('verify').public_numbers().x,
+                         other.get_op_key('verify').public_numbers().x)
+
+        # A failed mutation must not destroy a still valid cache entry.
+        fresh = jwk.JWK.generate(kty='EC', crv='P-256')
+        valid = fresh.get_op_key('sign')
+        with self.assertRaises(jwk.InvalidJWKValue):
+            fresh['d'] = '***'
+        self.assertIs(fresh.get_op_key('sign'), valid)
+
+    def test_cache_revalidates_bypassed_storage_change(self):
+        # A subclass (or C-level caller) that writes to the underlying
+        # dict storage cannot run the overrides.  The lazy snapshot check
+        # in the key builders must still refuse to serve the old object.
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        pubkey = key.get_op_key('verify')
+        rotated = jwk.JWK.generate(kty='EC', crv='P-256')
+        dict.__setitem__(key, 'x', rotated['x'])
+        dict.__setitem__(key, 'y', rotated['y'])
+        current = key.get_op_key('verify')
+        self.assertIsNot(current, pubkey)
+        self.assertEqual(current.public_numbers().x,
+                         rotated.get_op_key('verify').public_numbers().x)
+        self.assertEqual(current.public_numbers().y,
+                         rotated.get_op_key('verify').public_numbers().y)
+
+    def test_cache_invalidated_on_material_delete(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        key.get_op_key('sign')
+        key.pop('d')
+        self.assertIsNone(key._cache_pri_k)
+        with self.assertRaises(jwk.InvalidJWKType):
+            key.get_op_key('sign')
+
+        key2 = jwk.JWK.generate(kty='EC', crv='P-256')
+        key2.get_op_key('sign')
+        del key2['d']
+        with self.assertRaises(jwk.InvalidJWKType):
+            key2.get_op_key('sign')
+
+        key3 = jwk.JWK.generate(kty='EC', crv='P-256')
+        key3.get_op_key('sign')
+        key3.popitem()
+        self.assertFalse(key3.has_private)
+        with self.assertRaises(jwk.InvalidJWKType):
+            key3.get_op_key('sign')
+
+        key4 = jwk.JWK.generate(kty='EC', crv='P-256')
+        key4.get_op_key('sign')
+        key4.clear()
+        self.assertEqual(key4, {})
+        with self.assertRaises(jwk.InvalidJWKType):
+            key4.get_op_key('sign')
+
+    def test_cache_import_after_use(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        key.get_op_key('sign')
+
+        replacement = jwk.JWK.generate(kty='EC', crv='P-521')
+        key.import_key(**replacement.export(as_dict=True))
+        self.assertEqual(key['crv'], 'P-521')
+        self.assertIsNotNone(key.get_op_key('sign'))
+        self.assertEqual(key.get_op_key('sign').curve.name, 'secp521r1')
+
+    def test_public_only_operations_raise_invalid_type(self):
+        pub = jwk.JWK.generate(kty='EC', crv='P-256').public()
+        with self.assertRaises(jwk.InvalidJWKType):
+            pub.get_op_key('sign')
+        pub = jwk.JWK.generate(kty='RSA', size=1024).public()
+        with self.assertRaises(jwk.InvalidJWKType):
+            pub.get_op_key('decrypt')
+        octkey = jwk.JWK.generate(kty='oct', size=128)
+        octkey.pop('k')
+        with self.assertRaises(jwk.InvalidJWKType):
+            octkey.get_op_key('sign')
+        with self.assertRaises(jwk.InvalidJWKType):
+            octkey.get_op_key()
+
+    def test_sign_then_restrict_sequence(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        s = jws.JWS(b'payload')
+        s.add_signature(key, None, {'alg': 'ES256'})
+        token = s.serialize(compact=True)
+
+        # Cache is populated by signing; a later operation restriction
+        # must still be enforced for the following signing attempt.
+        key.key_ops = ['verify']
+        with self.assertRaises(jwk.InvalidJWKOperation):
+            jws.JWS(b'other').add_signature(key, None, {'alg': 'ES256'})
+
+        # Verification is still allowed with the unchanged public part.
+        v = jws.JWS()
+        v.deserialize(token, key)
+        self.assertEqual(v.payload, b'payload')
+
+    def test_verify_then_rotate_material_sequence(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        s = jws.JWS(b'payload')
+        s.add_signature(key, None, {'alg': 'ES256'})
+        token = s.serialize(compact=True)
+        v = jws.JWS()
+        v.deserialize(token, key)
+        self.assertEqual(v.payload, b'payload')
+
+        # Rotate the real key material after a successful verification.
+        rotated = jwk.JWK.generate(kty='EC', crv='P-256')
+        key.update(rotated.export(as_dict=True))
+        rotated_sign = jws.JWS(b'payload')
+        rotated_sign.add_signature(key, None, {'alg': 'ES256'})
+        rotated_token = rotated_sign.serialize(compact=True)
+
+        # The old token must no longer verify with the rotated public key.
+        with self.assertRaises(jws.InvalidJWSSignature):
+            jws.JWS().deserialize(token, key)
+        # The new token must, using explicitly the rotated key's public part.
+        v = jws.JWS()
+        v.deserialize(rotated_token, rotated.public())
+        self.assertEqual(v.payload, b'payload')
+
+    def test_sign_then_rotate_material_sequence(self):
+        key = jwk.JWK.generate(kty='EC', crv='P-256')
+        s = jws.JWS(b'old')
+        s.add_signature(key, None, {'alg': 'ES256'})
+        s.serialize(compact=True)
+
+        rotated = jwk.JWK.generate(kty='EC', crv='P-256')
+        old_d = key['d']
+        key.pop('d')
+        key.update({k: rotated[k] for k in ('x', 'y', 'd')})
+        self.assertEqual(key['d'], rotated['d'])
+        self.assertNotEqual(key['d'], old_d)
+
+        s2 = jws.JWS(b'new')
+        s2.add_signature(key, None, {'alg': 'ES256'})
+        token2 = s2.serialize(compact=True)
+        v = jws.JWS()
+        v.deserialize(token2, rotated.public())
+        self.assertEqual(v.payload, b'new')
+
+        # The signing cache must have been rebuilt from the new material.
+        self.assertEqual(
+            key.get_op_key('sign').private_numbers().private_value,
+            rotated.get_op_key('sign').private_numbers().private_value)
+
+    def test_decrypt_then_revoke_sequence(self):
+        key = jwk.JWK.generate(kty='oct', size=256,
+                               use='enc', key_ops=['encrypt', 'decrypt'])
+        e = jwe.JWE(b'secret', '{"alg":"A256KW","enc":"A256GCM"}')
+        e.add_recipient(key)
+        token = e.serialize()
+        d = jwe.JWE()
+        d.deserialize(token, key)
+        self.assertEqual(d.payload, b'secret')
+
+        # The decryption does not populate a cryptography-object cache,
+        # but the revocation must be honoured by the next attempt anyway.
+        key.use = 'sig'
+        key.key_ops = ['sign', 'verify']
+        with self.assertRaises(jwe.InvalidJWEData):
+            jwe.JWE().deserialize(token, key)
+
+    def test_key_ops_empty_denies(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        key.key_ops = []
+        with self.assertRaises(jwk.InvalidJWKOperation):
+            key.get_op_key('sign')
+        with self.assertRaises(jwk.InvalidJWKOperation):
+            key.get_op_key('verify')
+
 
 # RFC 7515 - A.1
 A1_protected = \

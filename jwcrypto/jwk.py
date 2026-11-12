@@ -366,7 +366,23 @@ class JWK(dict):
     This object represents a Key.
     It must be instantiated by using the standard defined key/value pairs
     as arguments of the initialization function.
+
+    The transient cryptography objects built from the key material are
+    cached lazily.  A cache entry is associated with a snapshot of the
+    material parameters that define it (the type specific key values and,
+    for AKP keys, "alg").  Cache lookups compare that snapshot with the
+    current JWK contents, so any mutation of key material is observed even
+    if it bypasses this class's dict methods.  Metadata such as "kid",
+    "use", "key_ops" and the X.509 parameters are not part of the snapshot:
+    changing them keeps the cache and the usage constraints are re-evaluated
+    on every :meth:`get_op_key` call.
     """
+
+    # Class level defaults make cache helpers safe on partially
+    # initialized or unpickled instances.
+    _cache_pub_k = None
+    _cache_pri_k = None
+    _cache_material = None
 
     def __init__(self, **kwargs):
         r"""Creates a new JWK object.
@@ -403,6 +419,7 @@ class JWK(dict):
         super(JWK, self).__init__()
         self._cache_pub_k = None
         self._cache_pri_k = None
+        self._cache_material = None
         self.unsafe_skip_rsa_key_validation = False
 
         if 'generate' in kwargs:
@@ -653,8 +670,6 @@ class JWK(dict):
     def import_key(self, **kwargs):
         newkey = {}
         key_vals = 0
-        self._cache_pub_k = None
-        self._cache_pri_k = None
 
         names = list(kwargs.keys())
 
@@ -906,12 +921,89 @@ class JWK(dict):
         if use and use != usage:
             raise InvalidJWKUsage(usage, use)
         ops = self.get('key_ops')
-        if ops:
+        if ops is not None:
             if not isinstance(ops, list):
                 ops = [ops]
+            # An explicitly empty list denies every operation, as does
+            # any list that does not contain the requested one.
             if operation not in ops:
                 raise InvalidJWKOperation(operation, ops)
         # TODO: check alg ?
+
+    def _material_params(self):
+        """Return the parameters that define the cached key objects.
+
+        Metadata such as "kid", "use" and "key_ops" intentionally is not
+        included: it does not change the mathematical key and is checked
+        separately on every operation.
+        """
+        kty = self.get('kty')
+        values = JWKValuesRegistry.get(kty)
+        if values is None:
+            return ()
+        params = tuple((name, self.get(name)) for name in sorted(values))
+        if kty == 'AKP':
+            # "alg" selects the key algorithm and is therefore material.
+            params += (('alg', self.get('alg')),)
+        return params
+
+    def _invalidate_key_cache(self):
+        self._cache_pub_k = None
+        self._cache_pri_k = None
+        self._cache_material = None
+
+    def _cache_get(self, private):
+        if self._cache_material != self._material_params():
+            self._invalidate_key_cache()
+            return None
+        if private:
+            return self._cache_pri_k
+        return self._cache_pub_k
+
+    def _cache_set(self, key, private):
+        material = self._material_params()
+        if self._cache_material != material:
+            self._cache_pub_k = None
+            self._cache_pri_k = None
+            self._cache_material = material
+        if private:
+            self._cache_pri_k = key
+        else:
+            self._cache_pub_k = key
+
+    def _has_complete_material(self, private):
+        """Whether all values needed to build the requested key exist.
+
+        This is stricter than has_public/has_private, which report the
+        presence of any public/private value and are kept for backwards
+        compatibility.  Here a deletion of one parameter of a key must not
+        fall through to a low-level error while rebuilding the key.
+        """
+        kty = self.get('kty')
+        values = JWKValuesRegistry.get(kty)
+        if values is None:
+            return False
+        for name, param in values.items():
+            if param.type == ParmType.unsupported:
+                continue
+            needed = param.required or (private and not param.public)
+            if needed and name not in self:
+                return False
+        if kty == 'AKP' and 'alg' not in self:
+            return False
+        return True
+
+    def _require_private_material(self):
+        if not self._has_complete_material(private=True):
+            msg = 'No key material available' if self.is_symmetric \
+                else 'No private key available'
+            raise InvalidJWKType(msg)
+
+    def _require_public_material(self):
+        if not self._has_complete_material(private=False):
+            msg = 'No key material available' if self.is_symmetric \
+                else 'No public key available'
+            raise InvalidJWKType(msg)
 
     def _decode_int(self, n):
         return int(hexlify(base64url_decode(n)), 16)
@@ -931,19 +1023,19 @@ class JWK(dict):
         return rsa.RSAPrivateNumbers(p, q, d, dp, dq, qi, self._rsa_pub_n())
 
     def _rsa_pub(self):
-        k = self._cache_pub_k
+        k = self._cache_get(private=False)
         if k is None:
             k = self._rsa_pub_n().public_key(default_backend())
-            self._cache_pub_k = k
+            self._cache_set(k, private=False)
         return k
 
     def _rsa_pri(self):
-        k = self._cache_pri_k
+        k = self._cache_get(private=True)
         if k is None:
             u = self.unsafe_skip_rsa_key_validation
             k = self._rsa_pri_n().private_key(default_backend(),
                                               unsafe_skip_rsa_key_validation=u)
-            self._cache_pri_k = k
+            self._cache_set(k, private=True)
         return k
 
     def _ec_pub_n(self, curve):
@@ -957,21 +1049,21 @@ class JWK(dict):
         return ec.EllipticCurvePrivateNumbers(d, self._ec_pub_n(curve))
 
     def _ec_pub(self, curve):
-        k = self._cache_pub_k
+        k = self._cache_get(private=False)
         if k is None:
             k = self._ec_pub_n(curve).public_key(default_backend())
-            self._cache_pub_k = k
+            self._cache_set(k, private=False)
         return k
 
     def _ec_pri(self, curve):
-        k = self._cache_pri_k
+        k = self._cache_get(private=True)
         if k is None:
             k = self._ec_pri_n(curve).private_key(default_backend())
-            self._cache_pri_k = k
+            self._cache_set(k, private=True)
         return k
 
     def _okp_pub(self):
-        k = self._cache_pub_k
+        k = self._cache_get(private=False)
         if k is None:
             crv = self.get('crv')
             try:
@@ -981,11 +1073,11 @@ class JWK(dict):
 
             x = base64url_decode(self.get('x'))
             k = pubkey.from_public_bytes(x)
-            self._cache_pub_k = k
+            self._cache_set(k, private=False)
         return k
 
     def _okp_pri(self):
-        k = self._cache_pri_k
+        k = self._cache_get(private=True)
         if k is None:
             crv = self.get('crv')
             try:
@@ -995,11 +1087,11 @@ class JWK(dict):
 
             d = base64url_decode(self.get('d'))
             k = privkey.from_private_bytes(d)
-            self._cache_pri_k = k
+            self._cache_set(k, private=True)
         return k
 
     def _akp_pub(self):
-        k = self._cache_pub_k
+        k = self._cache_get(private=False)
         if k is None:
             alg = self.get('alg')
             if alg not in _AKP_ALG_TABLE:
@@ -1007,11 +1099,11 @@ class JWK(dict):
             pubkey_class = _AKP_ALG_TABLE[alg].pubkey
             pub_bytes = base64url_decode(self.get('pub'))
             k = pubkey_class.from_public_bytes(pub_bytes)
-            self._cache_pub_k = k
+            self._cache_set(k, private=False)
         return k
 
     def _akp_pri(self):
-        k = self._cache_pri_k
+        k = self._cache_get(private=True)
         if k is None:
             alg = self.get('alg')
             if alg not in _AKP_ALG_TABLE:
@@ -1019,20 +1111,28 @@ class JWK(dict):
             privkey_class = _AKP_ALG_TABLE[alg].privkey
             seed = base64url_decode(self.get('priv'))
             k = privkey_class.from_seed_bytes(seed)
-            self._cache_pri_k = k
+            self._cache_set(k, private=True)
         return k
 
     def _get_public_key(self, arg=None):
         ktype = self.get('kty')
         if ktype == 'oct':
+            if 'k' not in self:
+                raise InvalidJWKType('No key material available')
             return self.get('k')
+        elif ktype is None:
+            raise InvalidJWKType('No key material available')
         elif ktype == 'RSA':
+            self._require_public_material()
             return self._rsa_pub()
         elif ktype == 'EC':
+            self._require_public_material()
             return self._ec_pub(arg)
         elif ktype == 'OKP':
+            self._require_public_material()
             return self._okp_pub()
         elif ktype == 'AKP':
+            self._require_public_material()
             return self._akp_pub()
         else:
             raise NotImplementedError
@@ -1040,14 +1140,22 @@ class JWK(dict):
     def _get_private_key(self, arg=None):
         ktype = self.get('kty')
         if ktype == 'oct':
+            if 'k' not in self:
+                raise InvalidJWKType('No key material available')
             return self.get('k')
+        elif ktype is None:
+            raise InvalidJWKType('No key material available')
         elif ktype == 'RSA':
+            self._require_private_material()
             return self._rsa_pri()
         elif ktype == 'EC':
+            self._require_private_material()
             return self._ec_pri(arg)
         elif ktype == 'OKP':
+            self._require_private_material()
             return self._okp_pri()
         elif ktype == 'AKP':
+            self._require_private_material()
             return self._akp_pri()
         else:
             raise NotImplementedError
@@ -1056,6 +1164,12 @@ class JWK(dict):
         """Get the key object associated to the requested operation.
         For example the public RSA key for the 'verify' operation or
         the private EC key for the 'decrypt' operation.
+
+        Usage constraints ("use" and "key_ops") are evaluated on every
+        call against the current JWK contents.  Key material changes
+        invalidate the internal cryptography object cache, so an object
+        returned by a previous call never bypasses a later restriction or
+        a replacement/deletion of the material it was built from.
 
         :param operation: The requested operation.
          The valid set of operations is available in the
@@ -1067,16 +1181,21 @@ class JWK(dict):
          not permitted with this key.
         :raises InvalidJWKUsage: if the use constraints do not permit
          the operation.
+        :raises InvalidJWKType: if the requested key material (for
+         example the private key) is not present.
 
         :return: A Python Cryptography key object for asymmetric keys
             or a baseurl64_encoded octet string for symmetric keys
         """
-        validops = self.get('key_ops',
-                            list(JWKOperationsRegistry.keys()))
-        if validops is not list:
+        validops = self.get('key_ops')
+        if validops is None:
+            validops = list(JWKOperationsRegistry.keys())
+        elif not isinstance(validops, list):
             validops = [validops]
         if operation is None:
             if self.get('kty') == 'oct':
+                if 'k' not in self:
+                    raise InvalidJWKType('No key material available')
                 return self.get('k')
             raise InvalidJWKOperation(operation, validops)
         elif operation == 'sign':
@@ -1274,10 +1393,8 @@ class JWK(dict):
                 raise ValueError('Cannot change key type')
 
         # Check if item is a key value and verify its format
-        if item in list(JWKValuesRegistry[kty].keys()):
-            # Invalidate cached keys if any
-            self._cache_pub_k = None
-            self._cache_pri_k = None
+        if kty is not None and item in list(JWKValuesRegistry[kty].keys()):
+            changed = self.get(item) != value
             if JWKValuesRegistry[kty][item].type == ParmType.b64:
                 try:
                     v = base64url_decode(value)
@@ -1298,6 +1415,10 @@ class JWK(dict):
                         '"%s" is not Base64urlUInt encoded' % item
                     ) from e
             super(JWK, self).__setitem__(item, value)
+            if changed:
+                # Invalidate cached keys only after the new value was
+                # accepted, and only when the material actually changed.
+                self._invalidate_key_cache()
             return
 
         # If not a key param check if it is a know parameter
@@ -1344,10 +1465,52 @@ class JWK(dict):
         kty = self.get('kty')
         if kty is not None and item in list(JWKValuesRegistry[kty].keys()):
             # Invalidate cached keys if any
-            self._cache_pub_k = None
-            self._cache_pri_k = None
+            self._invalidate_key_cache()
 
         super(JWK, self).__delitem__(item)
+
+    def pop(self, key, *args):
+        # Bypass dict.pop's C implementation, which would not run
+        # __delitem__ and could leave a stale cached key object behind.
+        if len(args) > 1:
+            raise TypeError('pop expected at most 2 arguments, got %d'
+                            % (len(args) + 1))
+        if key not in self:
+            if args:
+                return args[0]
+            raise KeyError(key)
+        value = self[key]
+        del self[key]
+        return value
+
+    def popitem(self):
+        # Bypass dict.popitem, which does not call __delitem__.  Prefer
+        # non-'kty' entries; 'kty' can only be removed when no key values
+        # remain, but still allow it for an otherwise empty key shell.
+        if not self:
+            raise KeyError('popitem(): dictionary is empty')
+        candidates = [k for k in reversed(self) if k != 'kty']
+        if not candidates and 'kty' in self:
+            candidates = ['kty']
+        for key in candidates:
+            try:
+                value = self[key]
+                del self[key]
+            except KeyError:
+                continue
+            return key, value
+        raise KeyError('popitem(): no removable item')
+
+    def clear(self):
+        # Bypass dict.clear, which does not call __delitem__.
+        super(JWK, self).clear()
+        self._invalidate_key_cache()
+
+    def __ior__(self, other):
+        # dict.__ior__ updates the underlying storage without going
+        # through __setitem__; route it through our checked update.
+        self.update(other)
+        return self
 
     def __eq__(self, other):
         if not isinstance(other, JWK):
